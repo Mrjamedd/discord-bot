@@ -1,0 +1,19 @@
+[Unit]
+Description=Discord Purchase Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/discord-purchase-bot
+Environment=DC_BOT_ENV_FILE=%h/.env
+EnvironmentFile=-%h/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/discord-purchase-bot/.venv/bin/python /opt/discord-purchase-bot/run_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+.DS_Store
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+runtime/
+credentials/
+
+.vscode/settings.json
+
+.dc_bot_state.json
+Bot Main file and utlities/.dc_bot_state.json
+Bot Main file and utlities/dc_bot.log
+Bot Main file and utlities/payment_parser.log
+Bot Main file and utlities/purchase_log.txt
+Bot Main file and utlities/purchase_sync_recovery.jsonl
+
+Bot Main file and utlities/gpc_files/*
+!Bot Main file and utlities/gpc_files/README.md
