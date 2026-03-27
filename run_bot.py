@@ -12,6 +12,7 @@ except RuntimeError as exc:
     print(f"Bootstrap error: {exc}", file=sys.stderr)
     raise SystemExit(1)
 
+# Keep the legacy module directory bootstrap in one place for deployment entry.
 PROJECT_MODULE_DIR = Path(__file__).resolve().parent / "Bot Main file and utlities"
 if str(PROJECT_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_MODULE_DIR))
