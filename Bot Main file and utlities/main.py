@@ -76,12 +76,12 @@ def _runtime_configuration_warnings() -> list[str]:
     if has_spreadsheet_id and not (has_inline_credentials or has_credentials_file):
         warnings.append(
             "Google Sheets sync is disabled because no credentials were provided. "
-            "Purchases will still be logged locally."
+            "Purchases will still be logged locally and structured error reports will only be streamed to stdout."
         )
     elif (has_inline_credentials or has_credentials_file) and not has_spreadsheet_id:
         warnings.append(
             "Google Sheets credentials are present but GOOGLE_SHEETS_SPREADSHEET_ID is not set. "
-            "Purchases will still be logged locally."
+            "Purchases will still be logged locally and structured error reports will only be streamed to stdout."
         )
     return warnings
 

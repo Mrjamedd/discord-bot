@@ -98,6 +98,9 @@ GOOGLE_SHEETS_CREDENTIALS_FILE = _parse_path_env(
 )
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
 GOOGLE_SHEETS_TAB_NAME = os.getenv("GOOGLE_SHEETS_TAB_NAME", "Log").strip() or "Log"
+GOOGLE_SHEETS_ERROR_TAB_NAME = (
+    os.getenv("GOOGLE_SHEETS_ERROR_TAB_NAME", "Bot Errors").strip() or "Bot Errors"
+)
 GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 PURCHASE_SYNC_RETRY_INTERVAL_SECONDS = 300
 

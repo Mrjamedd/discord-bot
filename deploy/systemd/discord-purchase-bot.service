@@ -2,18 +2,29 @@
 Description=Discord Purchase Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/discord-purchase-bot
-Environment=DC_BOT_ENV_FILE=%h/.env
-EnvironmentFile=-%h/.env
+Environment=DC_BOT_ENV_FILE=/home/ubuntu/.env
+EnvironmentFile=-/home/ubuntu/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/discord-purchase-bot/.venv/bin/python /opt/discord-purchase-bot/run_bot.py
-Restart=always
+Environment=BOT_GIT_REMOTE=origin
+Environment=BOT_GIT_BRANCH=main
+Environment=BOT_AUTO_PIP_INSTALL=1
+Environment=PYTHON_BIN=/opt/discord-purchase-bot/.venv/bin/python
+Environment=RUNNER_PATH=/opt/discord-purchase-bot/run_bot.py
+ExecStart=/opt/discord-purchase-bot/deploy/systemd/start_bot.sh
+SyslogIdentifier=discord-purchase-bot
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
 RestartSec=10
+TimeoutStartSec=900
 
 [Install]
 WantedBy=multi-user.target

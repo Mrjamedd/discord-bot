@@ -11,64 +11,55 @@ import discord
 
 from config import (
     DISCORD_MESSAGE_LIMIT,
-    LOG_FILE,
-    PAYMENT_PARSER_LOG_FILE,
 )
+from sheets_error_logger import GoogleSheetsErrorHandler
 
 
 def ensure_parent_directory(file_path: str | os.PathLike[str]) -> None:
     Path(file_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
 
+def _remove_local_file_handlers(logger: logging.Logger) -> None:
+    for handler in tuple(logger.handlers):
+        if not isinstance(handler, RotatingFileHandler):
+            continue
+        logger.removeHandler(handler)
+        handler.close()
+
+
 def setup_payment_parser_logger() -> logging.Logger:
     parser_logger = logging.getLogger("dc_bot.payment_parser")
     parser_logger.setLevel(logging.INFO)
-
-    parser_log_path = str(PAYMENT_PARSER_LOG_FILE)
-    for handler in parser_logger.handlers:
-        if getattr(handler, "baseFilename", None) == parser_log_path:
-            return parser_logger
-
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    ensure_parent_directory(PAYMENT_PARSER_LOG_FILE)
-    file_handler = RotatingFileHandler(
-        PAYMENT_PARSER_LOG_FILE,
-        maxBytes=1_000_000,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-    parser_logger.addHandler(file_handler)
+    _remove_local_file_handlers(parser_logger)
     parser_logger.propagate = True
     return parser_logger
 
 
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("dc_bot")
-    if logger.handlers:
-        setup_payment_parser_logger()
-        return logger
-
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    ensure_parent_directory(LOG_FILE)
+    _remove_local_file_handlers(logger)
 
-    file_handler = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=1_000_000,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    if not any(
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, GoogleSheetsErrorHandler)
+        for handler in logger.handlers
+    ):
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    if not any(
+        isinstance(handler, GoogleSheetsErrorHandler)
+        for handler in logger.handlers
+    ):
+        logger.addHandler(GoogleSheetsErrorHandler())
 
     logger.propagate = False
     setup_payment_parser_logger()
     return logger
+
 
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
