@@ -66,7 +66,7 @@ pip install -r requirements.txt
 python3 run_bot.py
 ```
 
-The launcher reads a repo-local `.env` automatically and falls back to `$HOME/.env` when the repo file is absent. Runtime startup also validates the canonical asset directory before the bot connects to Discord.
+The launcher reads a repo-local `.env` automatically and falls back to `$HOME/.env` when the repo file is absent. Runtime startup also validates the canonical asset directory before the bot connects to Discord. This quick-start flow is safe to use for basic local verification before moving on to OCI deployment.
 
 ## Cloud Deployment Notes
 
