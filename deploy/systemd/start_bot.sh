@@ -8,8 +8,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 BOT_GIT_REMOTE="${BOT_GIT_REMOTE:-origin}"
 BOT_GIT_BRANCH="${BOT_GIT_BRANCH:-main}"
 BOT_AUTO_PIP_INSTALL="${BOT_AUTO_PIP_INSTALL:-1}"
-PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
-PIP_BIN="${PIP_BIN:-$REPO_ROOT/.venv/bin/pip}"
+PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/venv/bin/python}"
+PIP_BIN="${PIP_BIN:-$REPO_ROOT/venv/bin/pip}"
 RUNNER_PATH="${RUNNER_PATH:-$REPO_ROOT/run_bot.py}"
 
 log() {

@@ -32,8 +32,8 @@ What is intentionally excluded:
 4. Install dependencies:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -81,8 +81,8 @@ sudo chown -R ubuntu:ubuntu /opt/discord-purchase-bot
 cd /opt/discord-purchase-bot
 cp .env.example /home/ubuntu/.env
 
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
 
 sudo ./deploy/systemd/install_oci_service.sh
 ```
@@ -100,7 +100,7 @@ How startup works with the default unit now:
 - `systemd` starts `deploy/systemd/start_bot.sh`
 - the wrapper verifies the repo is on `main` and clean
 - it fetches `origin/main` and fast-forwards the local checkout when remote changes exist
-- it runs `.venv/bin/pip install -r requirements.txt` only when `requirements.txt` changed
+- it runs `venv/bin/pip install -r requirements.txt` only when `requirements.txt` changed
 - it launches `python run_bot.py`
 
 If the live checkout is dirty, startup fails instead of overwriting local changes. That keeps the server copy aligned with GitHub instead of silently diverging.
