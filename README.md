@@ -31,27 +31,24 @@ The bot no longer reads asset directories from environment variables and no long
 
 ## Canonical Asset Catalog
 
-The bot expects these files in `/home/ubuntu/discord-bot/assets`:
+The bot builds the customer-facing script catalog by scanning every `.gpc` file in `/home/ubuntu/discord-bot/assets`.
 
-- `Corex-Aim_2K26.gpc`
-- `GOLDEN_FREE_v2.gpc`
-- `secretofscript(unrealeased) (1).gpc`
-- `SWOOSH V2.gpc`
+Known filenames keep friendly display names:
 
-Those filenames map to the product catalog as follows:
+- `Corex-Aim_2K26.gpc` -> `CoreX Aim 2K26`
+- `GOLDEN_FREE_v2.gpc` -> `Golden V2`
+- `secretofscript(unrealeased) (1).gpc` -> `Secret of Scripts V6`
+- `SWOOSH V2.gpc` -> `Swish V2`
 
-- `CoreX Aim 2K26` -> `Corex-Aim_2K26.gpc`
-- `Golden Free Aim V2` -> `GOLDEN_FREE_v2.gpc`
-- `Secret of Scripts V6` -> `secretofscript(unrealeased) (1).gpc`
-- `Swish V2` -> `SWOOSH V2.gpc`
+Any additional `.gpc` files in that folder are also added automatically using a filename-derived title.
 
-Startup fails fast when `/home/ubuntu/discord-bot/assets` is missing, unreadable, empty, or missing one of the required files.
+Startup fails fast when `/home/ubuntu/discord-bot/assets` is missing, unreadable, empty, or does not contain any delivery `.gpc` files.
 
 ## Fresh-Clone Quick Start
 
 1. Copy `.env.example` to `.env`.
 2. Fill in the required Discord, Gmail, and payment values.
-3. Create `/home/ubuntu/discord-bot/assets` and copy the four `.gpc` files there.
+3. Create `/home/ubuntu/discord-bot/assets` and copy the delivery `.gpc` files there.
 4. Install dependencies:
 
 ```bash
@@ -89,7 +86,7 @@ Use `systemd` as the process manager on the OCI Ubuntu VM. The active unit name 
 
 1. Clone the repo onto the server. The default `discordbot.service` template assumes `/opt/discord-purchase-bot`, but the install helper can render the service for any absolute path.
 2. Create the bot env file from `.env.example`. On OCI Ubuntu, the default service expects `/home/ubuntu/.env`.
-3. Create `/home/ubuntu/discord-bot/assets` and upload the four required `.gpc` files there.
+3. Create `/home/ubuntu/discord-bot/assets` and upload the delivery `.gpc` files there.
 4. If you use Google Sheets on Ubuntu, prefer `GOOGLE_SHEETS_CREDENTIALS_JSON` in the env file so you do not need to mount a credentials file.
 5. Create the virtual environment and install dependencies.
 6. Make sure the service user can `git fetch`/`git pull` the repo non-interactively. The default remote in this repo uses SSH, so the user running the service needs a working SSH deploy key or equivalent GitHub SSH access.
@@ -127,7 +124,7 @@ sudo systemctl stop discordbot
 How startup works with the default unit:
 
 - `discordbot.service` starts `deploy/systemd/start_bot.sh`
-- the wrapper verifies that `/home/ubuntu/discord-bot/assets` exists, is readable, is not empty, and still contains the required delivery files
+- the wrapper verifies that `/home/ubuntu/discord-bot/assets` exists, is readable, and contains at least one delivery `.gpc` file
 - it verifies the repo is on `main` and clean
 - it fetches `origin/main` and fast-forwards the local checkout when remote changes exist
 - it installs dependencies only when `requirements.txt` changed, using `PIP_BIN` when set or `PYTHON_BIN -m pip` otherwise

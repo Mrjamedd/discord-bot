@@ -53,6 +53,7 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
 
         self.assertIn("CoreX Aim 2K26", catalog_lines)
         self.assertIn("Corex-Aim_2K26.gpc", catalog_lines)
+        self.assertIn("Golden V2", catalog_lines)
         self.assertIn("delivery file:", catalog_lines)
 
     def test_ticket_retry_message_can_include_confirmation_hint(self) -> None:
@@ -67,6 +68,13 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
         self.assertEqual("matched", result.status)
         self.assertIsNotNone(result.product)
         self.assertEqual("golden-free-aim-v2", result.product.key)
+
+    def test_resolve_script_product_selection_supports_renamed_golden_label(self) -> None:
+        result = resolve_script_product_selection("golden v2")
+
+        self.assertEqual("matched", result.status)
+        self.assertIsNotNone(result.product)
+        self.assertEqual("Golden V2", result.product.label)
 
     def test_resolve_script_product_selection_reports_unmatched(self) -> None:
         result = resolve_script_product_selection("not a real product")

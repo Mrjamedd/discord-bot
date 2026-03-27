@@ -49,8 +49,8 @@ if [[ ! -r "$ASSET_DIR" || ! -x "$ASSET_DIR" ]]; then
   exit 1
 fi
 
-if ! find "$ASSET_DIR" -mindepth 1 -maxdepth 1 -type f -print -quit | grep -q .; then
-  log "Required asset directory is empty: $ASSET_DIR"
+if ! find "$ASSET_DIR" -mindepth 1 -maxdepth 1 -type f -iname '*.gpc' -print -quit | grep -q .; then
+  log "Required asset directory does not contain any delivery .gpc files: $ASSET_DIR"
   exit 1
 fi
 
