@@ -1,87 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 import secrets
 
 import discord
 
+from assets import build_script_products
 from config import (
     CASH_APP_CASHTAG,
     CONFIRM_SELECTION_RESPONSE,
     PAYMENT_CHECK_DELAY_SECONDS,
-    SCRIPT_FILES_DIR,
     SUPPORT_TICKET_PANEL_MESSAGE,
 )
 from models import PaymentPlatform, ScriptProduct
 from utils import build_channel_name, normalize_text
 
-SCRIPT_PRODUCTS = (
-    ScriptProduct(
-        key="corex-aim-2k26",
-        label="CoreX Aim 2K26",
-        price=23,
-        file_path=SCRIPT_FILES_DIR / "Corex-Aim_2K26.gpc",
-        aliases=(
-            "1",
-            "one",
-            "corex",
-            "corex aim",
-            "corex aim 2k26",
-            "corex aim nba2k26",
-            "corex 2k26",
-            "kobe plug and play",
-        ),
-    ),
-    ScriptProduct(
-        key="golden-free-aim-v2",
-        label="Golden Free Aim V2",
-        price=23,
-        file_path=SCRIPT_FILES_DIR / "GOLDEN_FREE_v2.gpc",
-        aliases=(
-            "2",
-            "two",
-            "golden",
-            "golden free",
-            "golden free aim",
-            "golden free v2",
-            "golden free aim v2",
-        ),
-    ),
-    ScriptProduct(
-        key="secret-of-scripts-v6",
-        label="Secret of Scripts V6",
-        price=23,
-        file_path=SCRIPT_FILES_DIR / "secretofscript(unrealeased) (1).gpc",
-        aliases=(
-            "3",
-            "three",
-            "secret",
-            "secret script",
-            "secret of scripts",
-            "secret of scripts v6",
-            "secretofscript",
-            "secretofscripts",
-            "the god of scripts",
-            "thegodofscripts",
-            "secret unreleased",
-        ),
-    ),
-    ScriptProduct(
-        key="swish-v2",
-        label="Swish V2",
-        price=23,
-        file_path=SCRIPT_FILES_DIR / "SWOOSH V2.gpc",
-        aliases=(
-            "4",
-            "four",
-            "swish",
-            "swish v2",
-            "swoosh",
-            "swoosh v2",
-            "featurezens",
-        ),
-    ),
-)
+SCRIPT_PRODUCTS: tuple[ScriptProduct, ...] = build_script_products()
 
 SCRIPT_PRODUCTS_BY_KEY: dict[str, ScriptProduct] = {
     product.key: product for product in SCRIPT_PRODUCTS
@@ -117,6 +52,14 @@ VALID_TICKET_STAGES: set[str] = {
     TICKET_STAGE_COMPLETED,
 }
 UNSET = object()
+
+
+@dataclass(frozen=True)
+class ScriptProductSelectionResult:
+    product: ScriptProduct | None
+    status: str
+    candidate_keys: tuple[str, ...] = ()
+
 
 def build_panel_catalog_lines() -> str:
     return "\n".join(
@@ -234,12 +177,15 @@ def message_contains_alias(normalized_message: str, alias: str) -> bool:
     return padded_alias in padded_message
 
 
-def find_script_product(selection: str) -> ScriptProduct | None:
+def resolve_script_product_selection(selection: str) -> ScriptProductSelectionResult:
     normalized_selection = normalize_text(selection)
     if not normalized_selection:
-        return None
+        return ScriptProductSelectionResult(
+            product=None,
+            status="empty",
+        )
 
-    best_product: ScriptProduct | None = None
+    best_products: list[ScriptProduct] = []
     best_score = 0
     for product in SCRIPT_PRODUCTS:
         candidate_aliases = (
@@ -259,12 +205,31 @@ def find_script_product(selection: str) -> ScriptProduct | None:
         if product_score == 0:
             continue
         if product_score > best_score:
-            best_product = product
+            best_products = [product]
             best_score = product_score
         elif product_score == best_score:
-            best_product = None
+            best_products.append(product)
 
-    return best_product
+    if best_score == 0:
+        return ScriptProductSelectionResult(
+            product=None,
+            status="unmatched",
+        )
+    if len(best_products) > 1:
+        return ScriptProductSelectionResult(
+            product=None,
+            status="ambiguous",
+            candidate_keys=tuple(product.key for product in best_products),
+        )
+    return ScriptProductSelectionResult(
+        product=best_products[0],
+        status="matched",
+        candidate_keys=(best_products[0].key,),
+    )
+
+
+def find_script_product(selection: str) -> ScriptProduct | None:
+    return resolve_script_product_selection(selection).product
 
 
 def resolve_script_product_key(product_key: str | None) -> str | None:

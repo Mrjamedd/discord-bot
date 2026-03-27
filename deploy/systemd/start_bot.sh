@@ -9,8 +9,9 @@ BOT_GIT_REMOTE="${BOT_GIT_REMOTE:-origin}"
 BOT_GIT_BRANCH="${BOT_GIT_BRANCH:-main}"
 BOT_AUTO_PIP_INSTALL="${BOT_AUTO_PIP_INSTALL:-1}"
 PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/venv/bin/python}"
-PIP_BIN="${PIP_BIN:-$REPO_ROOT/venv/bin/pip}"
+PIP_BIN="${PIP_BIN:-}"
 RUNNER_PATH="${RUNNER_PATH:-$REPO_ROOT/run_bot.py}"
+ASSET_DIR="/home/ubuntu/discord-bot/assets"
 
 log() {
   printf '[start_bot] %s\n' "$*"
@@ -30,6 +31,26 @@ fi
 
 if [[ ! -f "$RUNNER_PATH" ]]; then
   log "Bot launcher not found: $RUNNER_PATH"
+  exit 1
+fi
+
+if [[ ! -e "$ASSET_DIR" ]]; then
+  log "Required asset directory is missing: $ASSET_DIR"
+  exit 1
+fi
+
+if [[ ! -d "$ASSET_DIR" ]]; then
+  log "Required asset path is not a directory: $ASSET_DIR"
+  exit 1
+fi
+
+if [[ ! -r "$ASSET_DIR" || ! -x "$ASSET_DIR" ]]; then
+  log "Required asset directory is unreadable: $ASSET_DIR"
+  exit 1
+fi
+
+if ! find "$ASSET_DIR" -mindepth 1 -maxdepth 1 -type f -print -quit | grep -q .; then
+  log "Required asset directory is empty: $ASSET_DIR"
   exit 1
 fi
 
@@ -63,12 +84,17 @@ fi
 
 if [[ "$BOT_AUTO_PIP_INSTALL" == "1" ]]; then
   if (( requirements_changed )); then
-    if [[ ! -x "$PIP_BIN" ]]; then
-      log "pip executable not found: $PIP_BIN"
-      exit 1
+    if [[ -n "$PIP_BIN" ]]; then
+      if [[ ! -x "$PIP_BIN" ]]; then
+        log "pip executable not found: $PIP_BIN"
+        exit 1
+      fi
+      log "requirements.txt changed; installing dependencies with $PIP_BIN"
+      "$PIP_BIN" install -r "$REPO_ROOT/requirements.txt"
+    else
+      log "requirements.txt changed; installing dependencies with $PYTHON_BIN -m pip"
+      "$PYTHON_BIN" -m pip install -r "$REPO_ROOT/requirements.txt"
     fi
-    log "requirements.txt changed; installing dependencies"
-    "$PIP_BIN" install -r "$REPO_ROOT/requirements.txt"
   else
     log "requirements.txt unchanged; skipping pip install"
   fi

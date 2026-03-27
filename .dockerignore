@@ -8,11 +8,16 @@ __pycache__
 *.pyd
 .pytest_cache
 .mypy_cache
+.ruff_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
 .DS_Store
 .env
 .env.*
 .vscode
+.idea
 runtime
 credentials
-Bot Main file and utlities/gpc_files/*
-!Bot Main file and utlities/gpc_files/README.md
+Bot%20Main%20file%20and%20utlities

@@ -3,13 +3,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from deployment_bootstrap import bootstrap_environment
+from environment_loader import load_dotenv_if_present
 
 
 try:
-    bootstrap_environment()
-except RuntimeError as exc:
-    print(f"Bootstrap error: {exc}", file=sys.stderr)
+    load_dotenv_if_present()
+except OSError as exc:
+    print(f"Environment load error: {exc}", file=sys.stderr)
     raise SystemExit(1)
 
 # Keep the legacy module directory bootstrap in one place for deployment entry.

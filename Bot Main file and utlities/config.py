@@ -4,8 +4,7 @@ import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-MODULE_DIR = Path(__file__).resolve().parent
-REPO_ROOT = MODULE_DIR.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _parse_csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -79,10 +78,6 @@ PAYMENT_PARSER_LOG_FILE = _parse_path_env(
     "DC_BOT_PAYMENT_PARSER_LOG_FILE",
     LOG_DIR / "payment_parser.log",
 )
-SCRIPT_FILES_DIR = _parse_path_env(
-    "SCRIPT_FILES_DIR",
-    MODULE_DIR / "gpc_files",
-)
 PURCHASE_LOG_FILE = _parse_path_env(
     "DC_BOT_PURCHASE_LOG_FILE",
     DATA_DIR / "purchase_log.jsonl",
@@ -98,6 +93,10 @@ GOOGLE_SHEETS_CREDENTIALS_FILE = _parse_path_env(
 )
 GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
 GOOGLE_SHEETS_TAB_NAME = os.getenv("GOOGLE_SHEETS_TAB_NAME", "Log").strip() or "Log"
+GOOGLE_SHEETS_AUDIT_TAB_NAME = (
+    os.getenv("GOOGLE_SHEETS_AUDIT_TAB_NAME", "Purchase Audit").strip()
+    or "Purchase Audit"
+)
 GOOGLE_SHEETS_ERROR_TAB_NAME = (
     os.getenv("GOOGLE_SHEETS_ERROR_TAB_NAME", "Bot Errors").strip() or "Bot Errors"
 )

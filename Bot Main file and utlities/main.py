@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+from assets import validate_script_asset_directory
 from bot import DiscordPurchaseBot
 from config import (
     CASH_APP_CASHTAG,
@@ -12,13 +13,13 @@ from config import (
     GOOGLE_SHEETS_CREDENTIALS_JSON_ENV,
     GOOGLE_SHEETS_SPREADSHEET_ID,
     PAYMENT_PARSER_GMAIL_ADDRESS,
-    SCRIPT_FILES_DIR,
     SUPPORT_MODERATOR_ROLE_ID,
     SUPPORT_TICKET_CATEGORY_ID,
     SUPPORT_TICKET_PANEL_CHANNEL_ID,
     TICKET_CATEGORY_ID,
     TICKET_PANEL_CHANNEL_ID,
 )
+from purchase_audit_logger import PurchaseFlowAuditLogger
 from purchase_logger import PurchaseLogger
 from ticketing import SCRIPT_PRODUCTS
 from utils import setup_logger
@@ -56,15 +57,7 @@ def _runtime_configuration_errors() -> list[str]:
     if not CASH_APP_CASHTAG or CASH_APP_CASHTAG == "$CHANGE_ME":
         errors.append("CASH_APP_CASHTAG must be set to the payment destination you advertise to customers.")
 
-    if not SCRIPT_FILES_DIR.is_dir():
-        errors.append(
-            f"SCRIPT_FILES_DIR does not exist or is not a directory: {SCRIPT_FILES_DIR}"
-        )
-        return errors
-
-    for product in SCRIPT_PRODUCTS:
-        if not product.file_path.is_file():
-            errors.append(f"Missing delivery file for {product.label}: {product.file_path}")
+    errors.extend(validate_script_asset_directory(SCRIPT_PRODUCTS))
     return errors
 
 
@@ -76,12 +69,12 @@ def _runtime_configuration_warnings() -> list[str]:
     if has_spreadsheet_id and not (has_inline_credentials or has_credentials_file):
         warnings.append(
             "Google Sheets sync is disabled because no credentials were provided. "
-            "Purchases will still be logged locally and structured error reports will only be streamed to stdout."
+            "Completed purchases will still be logged locally, but purchase audit logging and structured error reports will not be written to Google Sheets."
         )
     elif (has_inline_credentials or has_credentials_file) and not has_spreadsheet_id:
         warnings.append(
             "Google Sheets credentials are present but GOOGLE_SHEETS_SPREADSHEET_ID is not set. "
-            "Purchases will still be logged locally and structured error reports will only be streamed to stdout."
+            "Completed purchases will still be logged locally, but purchase audit logging and structured error reports will not be written to Google Sheets."
         )
     return warnings
 
@@ -99,9 +92,11 @@ def main() -> int:
     for warning in _runtime_configuration_warnings():
         logger.warning("startup_configuration_warning %s", warning)
     purchase_logger = PurchaseLogger(logger)
+    audit_logger = PurchaseFlowAuditLogger(logger)
     bot = DiscordPurchaseBot(
         logger=logger,
         purchase_logger=purchase_logger,
+        audit_logger=audit_logger,
     )
     bot.run(discord_token)
     return 0

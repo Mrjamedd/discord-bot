@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /app/runtime /app/credentials && chown -R appuser:appuser /app
+RUN mkdir -p /app/runtime /app/credentials /home/ubuntu/discord-bot/assets \
+    && chown -R appuser:appuser /app /home/ubuntu
 
 USER appuser
 

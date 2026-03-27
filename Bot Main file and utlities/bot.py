@@ -31,7 +31,15 @@ from discord_views import (
     TicketLauncherView,
     payment_platform_button_custom_id,
 )
-from models import BotState, PaymentParserResult, PurchaseRecord, ScriptProduct, TicketRecord
+from models import (
+    BotState,
+    PaymentParserResult,
+    PaymentPlatform,
+    PurchaseRecord,
+    ScriptProduct,
+    TicketRecord,
+)
+from purchase_audit_logger import PurchaseFlowAuditLogger
 from purchase_logger import PurchaseLogger
 from state_manager import (
     fresh_ticket_record,
@@ -62,16 +70,17 @@ from ticketing import (
     build_ticket_panel_message,
     build_ticket_retry_message,
     build_ticket_store_message,
-    find_script_product,
     generate_payment_note_code,
     get_payment_platform_by_key,
     get_script_product_by_key,
     message_is_selection_confirmation,
+    resolve_script_product_selection,
     ticket_owner_id_from_topic,
     ticket_owner_topic,
 )
 from utils import (
     message_has_component_custom_id,
+    normalize_text,
     split_message,
     utc_timestamp,
 )
@@ -82,12 +91,14 @@ class DiscordPurchaseBot(discord.Client):
         *,
         logger: logging.Logger,
         purchase_logger: PurchaseLogger,
+        audit_logger: PurchaseFlowAuditLogger,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
         self.logger = logger
         self.purchase_logger = purchase_logger
+        self.audit_logger = audit_logger
         self.response_allowed_mentions: discord.AllowedMentions = (
             discord.AllowedMentions.none()
         )
@@ -120,6 +131,376 @@ class DiscordPurchaseBot(discord.Client):
 
     def build_payment_confirmation_view(self) -> PaymentConfirmationView:
         return PaymentConfirmationView(self)
+
+    def interaction_custom_id(self, interaction: discord.Interaction) -> str | None:
+        if isinstance(interaction.data, dict):
+            custom_id = interaction.data.get("custom_id")
+            if isinstance(custom_id, str):
+                return custom_id
+        return None
+
+    async def resolve_user_identity(
+        self,
+        user_id: int,
+        *,
+        guild: discord.Guild | None = None,
+    ) -> tuple[str, str]:
+        if guild is not None:
+            member = guild.get_member(user_id)
+            if member is not None:
+                username = member.name
+                display_name = member.display_name or username
+                return username, display_name
+
+        cached_user = self.get_user(user_id)
+        if cached_user is not None:
+            username = cached_user.name
+            display_name = getattr(cached_user, "display_name", username) or username
+            return username, display_name
+
+        try:
+            fetched_user = await self.fetch_user(user_id)
+        except discord.DiscordException:
+            self.logger.exception(
+                "user_lookup_failed user_id=%s guild_id=%s timestamp=%s",
+                user_id,
+                None if guild is None else guild.id,
+                utc_timestamp(),
+            )
+            fallback_name = f"unknown-user-{user_id}"
+            return fallback_name, fallback_name
+
+        username = fetched_user.name
+        display_name = getattr(fetched_user, "display_name", username) or username
+        return username, display_name
+
+    async def audit_purchase_event(
+        self,
+        event_type: str,
+        *,
+        event_category: str,
+        status: str,
+        trigger: str,
+        channel: discord.TextChannel | None = None,
+        interaction: discord.Interaction | None = None,
+        message: discord.Message | None = None,
+        actor_user_id: int | None = None,
+        ticket_owner_id: int | None = None,
+        ticket_record: TicketRecord | None = None,
+        ticket_stage: str | None = None,
+        previous_ticket_stage: str | None = None,
+        next_ticket_stage: str | None = None,
+        product: ScriptProduct | None = None,
+        platform: PaymentPlatform | None = None,
+        payment_note_code: str | None = None,
+        button_custom_id: str | None = None,
+        raw_user_input: str | None = None,
+        normalized_user_input: str | None = None,
+        failure_reason: str | None = None,
+        error: BaseException | None = None,
+        gmail_message_id: str | None = None,
+        purchase_event_id: str | None = None,
+        delivery_filename: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        if not self.audit_logger.should_log():
+            return
+
+        try:
+            resolved_channel = channel
+            if resolved_channel is None and interaction is not None and isinstance(
+                interaction.channel,
+                discord.TextChannel,
+            ):
+                resolved_channel = interaction.channel
+            if resolved_channel is None and message is not None and isinstance(
+                message.channel,
+                discord.TextChannel,
+            ):
+                resolved_channel = message.channel
+
+            guild = (
+                resolved_channel.guild
+                if resolved_channel is not None
+                else interaction.guild
+                if interaction is not None
+                else message.guild
+                if message is not None
+                else None
+            )
+
+            actor_username = ""
+            actor_display_name = ""
+            if interaction is not None:
+                actor_user_id = interaction.user.id
+                actor_username = interaction.user.name
+                actor_display_name = (
+                    getattr(interaction.user, "display_name", interaction.user.name)
+                    or interaction.user.name
+                )
+            elif message is not None:
+                actor_user_id = message.author.id
+                actor_username = message.author.name
+                actor_display_name = (
+                    getattr(message.author, "display_name", message.author.name)
+                    or message.author.name
+                )
+
+            if actor_user_id is not None and not actor_username:
+                actor_username, actor_display_name = await self.resolve_user_identity(
+                    actor_user_id,
+                    guild=guild,
+                )
+
+            if ticket_record is not None and ticket_owner_id is None:
+                owner_id_value = ticket_record.get("owner_id")
+                if isinstance(owner_id_value, int) and not isinstance(owner_id_value, bool):
+                    ticket_owner_id = owner_id_value
+
+            ticket_owner_username = ""
+            if ticket_owner_id is not None:
+                if actor_user_id == ticket_owner_id and actor_username:
+                    ticket_owner_username = actor_username
+                else:
+                    ticket_owner_username, _ = await self.resolve_user_identity(
+                        ticket_owner_id,
+                        guild=guild,
+                    )
+
+            if ticket_record is not None and ticket_stage is None:
+                stage_value = ticket_record.get("stage")
+                if isinstance(stage_value, str):
+                    ticket_stage = stage_value
+
+            if product is None and ticket_record is not None:
+                product = get_script_product_by_key(
+                    cast(str | None, ticket_record.get("selected_script_key"))
+                )
+            if platform is None and ticket_record is not None:
+                platform = get_payment_platform_by_key(
+                    cast(str | None, ticket_record.get("payment_platform_key"))
+                )
+            if payment_note_code is None and ticket_record is not None:
+                payment_note_code = cast(str | None, ticket_record.get("payment_note_code"))
+            if delivery_filename is None and product is not None:
+                delivery_filename = product.file_path.name
+            if button_custom_id is None and interaction is not None:
+                button_custom_id = self.interaction_custom_id(interaction)
+
+            event: dict[str, object] = {
+                "logged_at_utc": utc_timestamp(),
+                "event_type": event_type,
+                "event_category": event_category,
+                "status": status,
+                "trigger": trigger,
+                "ticket_stage": ticket_stage or next_ticket_stage or previous_ticket_stage or "",
+                "previous_ticket_stage": previous_ticket_stage or "",
+                "next_ticket_stage": next_ticket_stage or "",
+                "discord_user_id": actor_user_id,
+                "discord_username": actor_username,
+                "discord_display_name": actor_display_name,
+                "ticket_owner_id": ticket_owner_id,
+                "ticket_owner_username": ticket_owner_username,
+                "channel_id": None if resolved_channel is None else resolved_channel.id,
+                "channel_name": None if resolved_channel is None else resolved_channel.name,
+                "guild_id": None if guild is None else guild.id,
+                "guild_name": None if guild is None else guild.name,
+                "message_id": (
+                    message.id
+                    if message is not None
+                    else interaction.message.id
+                    if interaction is not None and interaction.message is not None
+                    else None
+                ),
+                "interaction_id": None if interaction is None else interaction.id,
+                "button_custom_id": button_custom_id,
+                "raw_user_input": raw_user_input or "",
+                "normalized_user_input": normalized_user_input or "",
+                "selected_product_key": None if product is None else product.key,
+                "selected_product_label": None if product is None else product.label,
+                "selected_product_filename": (
+                    None if product is None else product.file_path.name
+                ),
+                "selected_price": None if product is None else product.price,
+                "payment_platform_key": None if platform is None else platform.key,
+                "payment_platform_label": None if platform is None else platform.label,
+                "payment_note_code": payment_note_code or "",
+                "delivery_filename": delivery_filename or "",
+                "gmail_message_id": gmail_message_id or "",
+                "purchase_event_id": purchase_event_id or "",
+                "failure_reason": failure_reason or "",
+                "error_type": "" if error is None else type(error).__name__,
+                "error_message": "" if error is None else str(error),
+                "details": details or {},
+            }
+            self.audit_logger.log_event(event)
+        except Exception:
+            self.logger.exception(
+                "purchase_audit_event_failed event_type=%s timestamp=%s",
+                event_type,
+                utc_timestamp(),
+            )
+
+    async def audit_stage_transition(
+        self,
+        *,
+        trigger: str,
+        channel: discord.TextChannel | None = None,
+        interaction: discord.Interaction | None = None,
+        message: discord.Message | None = None,
+        actor_user_id: int | None = None,
+        ticket_owner_id: int | None = None,
+        ticket_record: TicketRecord | None = None,
+        previous_ticket_stage: str | None,
+        next_ticket_stage: str | None,
+        product: ScriptProduct | None = None,
+        platform: PaymentPlatform | None = None,
+        payment_note_code: str | None = None,
+        button_custom_id: str | None = None,
+        raw_user_input: str | None = None,
+        normalized_user_input: str | None = None,
+        failure_reason: str | None = None,
+        error: BaseException | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        if previous_ticket_stage == next_ticket_stage:
+            return
+
+        await self.audit_purchase_event(
+            "ticket_stage_transition",
+            event_category="state",
+            status="success" if error is None else "failure",
+            trigger=trigger,
+            channel=channel,
+            interaction=interaction,
+            message=message,
+            actor_user_id=actor_user_id,
+            ticket_owner_id=ticket_owner_id,
+            ticket_record=ticket_record,
+            ticket_stage=next_ticket_stage,
+            previous_ticket_stage=previous_ticket_stage,
+            next_ticket_stage=next_ticket_stage,
+            product=product,
+            platform=platform,
+            payment_note_code=payment_note_code,
+            button_custom_id=button_custom_id,
+            raw_user_input=raw_user_input,
+            normalized_user_input=normalized_user_input,
+            failure_reason=failure_reason,
+            error=error,
+            details=details,
+        )
+
+    async def report_purchase_flow_exception(
+        self,
+        *,
+        event_type: str,
+        trigger: str,
+        error: BaseException,
+        channel: discord.TextChannel | None = None,
+        interaction: discord.Interaction | None = None,
+        message: discord.Message | None = None,
+        actor_user_id: int | None = None,
+        ticket_owner_id: int | None = None,
+        ticket_record: TicketRecord | None = None,
+        button_custom_id: str | None = None,
+        raw_user_input: str | None = None,
+        normalized_user_input: str | None = None,
+        failure_reason: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            resolved_channel = channel
+            if resolved_channel is None and interaction is not None and isinstance(
+                interaction.channel,
+                discord.TextChannel,
+            ):
+                resolved_channel = interaction.channel
+            if resolved_channel is None and message is not None and isinstance(
+                message.channel,
+                discord.TextChannel,
+            ):
+                resolved_channel = message.channel
+
+            if button_custom_id is None and interaction is not None:
+                button_custom_id = self.interaction_custom_id(interaction)
+
+            if actor_user_id is None:
+                if interaction is not None:
+                    actor_user_id = interaction.user.id
+                elif message is not None:
+                    actor_user_id = message.author.id
+
+            if (
+                resolved_channel is not None
+                and self.is_purchase_ticket_channel(resolved_channel)
+                and ticket_owner_id is None
+            ):
+                try:
+                    ticket_owner_id = await self.get_authoritative_ticket_owner_id(
+                        resolved_channel
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "purchase_flow_exception_owner_lookup_failed channel_id=%s event_type=%s timestamp=%s",
+                        resolved_channel.id,
+                        event_type,
+                        utc_timestamp(),
+                    )
+
+            if (
+                resolved_channel is not None
+                and self.is_purchase_ticket_channel(resolved_channel)
+                and ticket_record is None
+            ):
+                try:
+                    ticket_record = await self.get_ticket_record_snapshot(
+                        resolved_channel.id,
+                        owner_id=ticket_owner_id,
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "purchase_flow_exception_ticket_record_lookup_failed channel_id=%s event_type=%s timestamp=%s",
+                        resolved_channel.id,
+                        event_type,
+                        utc_timestamp(),
+                    )
+
+            self.logger.error(
+                "purchase_flow_exception event_type=%s trigger=%s channel_id=%s user_id=%s ticket_owner_id=%s button_custom_id=%s timestamp=%s",
+                event_type,
+                trigger,
+                None if resolved_channel is None else resolved_channel.id,
+                actor_user_id,
+                ticket_owner_id,
+                button_custom_id,
+                utc_timestamp(),
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            await self.audit_purchase_event(
+                event_type,
+                event_category="exception",
+                status="failure",
+                trigger=trigger,
+                channel=resolved_channel,
+                interaction=interaction,
+                message=message,
+                actor_user_id=actor_user_id,
+                ticket_owner_id=ticket_owner_id,
+                ticket_record=ticket_record,
+                button_custom_id=button_custom_id,
+                raw_user_input=raw_user_input,
+                normalized_user_input=normalized_user_input,
+                failure_reason=failure_reason,
+                error=error,
+                details=details,
+            )
+        except Exception:
+            self.logger.exception(
+                "purchase_flow_exception_report_failed event_type=%s timestamp=%s",
+                event_type,
+                utc_timestamp(),
+            )
 
     def cleanup_payment_task(self, completed: asyncio.Future[None]) -> None:
         if isinstance(completed, asyncio.Task):
@@ -865,8 +1246,26 @@ class DiscordPurchaseBot(discord.Client):
         return channel
 
     async def handle_ticket_button(self, interaction: discord.Interaction) -> None:
+        button_custom_id = self.interaction_custom_id(interaction)
+        await self.audit_purchase_event(
+            "ticket_open_button_pressed",
+            event_category="interaction",
+            status="success",
+            trigger="button_press",
+            interaction=interaction,
+            button_custom_id=button_custom_id,
+        )
         guild = interaction.guild
         if guild is None:
+            await self.audit_purchase_event(
+                "ticket_open_rejected",
+                event_category="ticket",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="interaction is not in a guild",
+            )
             await interaction.response.send_message(
                 "Tickets can only be opened inside a server.",
                 ephemeral=True,
@@ -877,6 +1276,15 @@ class DiscordPurchaseBot(discord.Client):
         if member is None:
             member = guild.get_member(interaction.user.id)
         if member is None:
+            await self.audit_purchase_event(
+                "ticket_open_rejected",
+                event_category="ticket",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="member lookup failed",
+            )
             await interaction.response.send_message(
                 "I couldn't resolve your server membership. Please try again.",
                 ephemeral=True,
@@ -885,6 +1293,16 @@ class DiscordPurchaseBot(discord.Client):
 
         category = await self.get_ticket_category()
         if category is None or category.guild.id != guild.id:
+            await self.audit_purchase_event(
+                "ticket_open_rejected",
+                event_category="ticket",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                actor_user_id=member.id,
+                button_custom_id=button_custom_id,
+                failure_reason="ticket category unavailable",
+            )
             await interaction.response.send_message(
                 "The ticket category is unavailable right now. Please contact a moderator.",
                 ephemeral=True,
@@ -894,6 +1312,21 @@ class DiscordPurchaseBot(discord.Client):
         async with self.ticket_creation_lock:
             existing_channel = self.find_existing_ticket_channel(category, member.id)
             if existing_channel is not None:
+                await self.audit_purchase_event(
+                    "ticket_open_existing",
+                    event_category="ticket",
+                    status="ignored",
+                    trigger="button_press",
+                    channel=existing_channel,
+                    interaction=interaction,
+                    actor_user_id=member.id,
+                    ticket_owner_id=member.id,
+                    button_custom_id=button_custom_id,
+                    details={
+                        "existing_channel_id": existing_channel.id,
+                        "existing_channel_name": existing_channel.name,
+                    },
+                )
                 await interaction.response.send_message(
                     f"You already have an open ticket: {existing_channel.mention}",
                     ephemeral=True,
@@ -902,12 +1335,24 @@ class DiscordPurchaseBot(discord.Client):
 
             try:
                 ticket_channel = await self.create_ticket_channel(category, member)
-            except Exception:
+            except Exception as exc:
                 self.logger.exception(
                     "ticket_channel_create_failed guild_id=%s user_id=%s timestamp=%s",
                     guild.id,
                     member.id,
                     utc_timestamp(),
+                )
+                await self.audit_purchase_event(
+                    "ticket_open_failed",
+                    event_category="ticket",
+                    status="failure",
+                    trigger="button_press",
+                    interaction=interaction,
+                    actor_user_id=member.id,
+                    ticket_owner_id=member.id,
+                    button_custom_id=button_custom_id,
+                    error=exc,
+                    failure_reason="ticket channel creation failed",
                 )
                 await interaction.response.send_message(
                     "I couldn't create your ticket right now. Please try again shortly.",
@@ -922,14 +1367,60 @@ class DiscordPurchaseBot(discord.Client):
             member.id,
             utc_timestamp(),
         )
+        ticket_record = await self.get_ticket_record_snapshot(
+            ticket_channel.id,
+            owner_id=member.id,
+        )
+        await self.audit_purchase_event(
+            "ticket_opened",
+            event_category="ticket",
+            status="success",
+            trigger="button_press",
+            channel=ticket_channel,
+            interaction=interaction,
+            actor_user_id=member.id,
+            ticket_owner_id=member.id,
+            ticket_record=ticket_record,
+            ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+            button_custom_id=button_custom_id,
+        )
+        await self.audit_stage_transition(
+            trigger="button_press",
+            channel=ticket_channel,
+            interaction=interaction,
+            actor_user_id=member.id,
+            ticket_owner_id=member.id,
+            ticket_record=ticket_record,
+            previous_ticket_stage=None,
+            next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+            button_custom_id=button_custom_id,
+        )
         await interaction.response.send_message(
             f"Your ticket is ready: {ticket_channel.mention}",
             ephemeral=True,
         )
 
     async def handle_support_ticket_button(self, interaction: discord.Interaction) -> None:
+        button_custom_id = self.interaction_custom_id(interaction)
+        await self.audit_purchase_event(
+            "support_ticket_button_pressed",
+            event_category="interaction",
+            status="success",
+            trigger="button_press",
+            interaction=interaction,
+            button_custom_id=button_custom_id,
+        )
         guild = interaction.guild
         if guild is None:
+            await self.audit_purchase_event(
+                "support_ticket_open_rejected",
+                event_category="support",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="interaction is not in a guild",
+            )
             await interaction.response.send_message(
                 "Tickets can only be opened inside a server.",
                 ephemeral=True,
@@ -940,6 +1431,15 @@ class DiscordPurchaseBot(discord.Client):
         if member is None:
             member = guild.get_member(interaction.user.id)
         if member is None:
+            await self.audit_purchase_event(
+                "support_ticket_open_rejected",
+                event_category="support",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="member lookup failed",
+            )
             await interaction.response.send_message(
                 "I couldn't resolve your server membership. Please try again.",
                 ephemeral=True,
@@ -948,6 +1448,16 @@ class DiscordPurchaseBot(discord.Client):
 
         category = await self.get_support_ticket_category()
         if category is None or category.guild.id != guild.id:
+            await self.audit_purchase_event(
+                "support_ticket_open_rejected",
+                event_category="support",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                actor_user_id=member.id,
+                button_custom_id=button_custom_id,
+                failure_reason="support ticket category unavailable",
+            )
             await interaction.response.send_message(
                 "The support ticket category is unavailable right now. Please contact a moderator.",
                 ephemeral=True,
@@ -957,6 +1467,21 @@ class DiscordPurchaseBot(discord.Client):
         async with self.support_ticket_creation_lock:
             existing_channel = self.find_existing_ticket_channel(category, member.id)
             if existing_channel is not None:
+                await self.audit_purchase_event(
+                    "support_ticket_open_existing",
+                    event_category="support",
+                    status="ignored",
+                    trigger="button_press",
+                    channel=existing_channel,
+                    interaction=interaction,
+                    actor_user_id=member.id,
+                    ticket_owner_id=member.id,
+                    button_custom_id=button_custom_id,
+                    details={
+                        "existing_channel_id": existing_channel.id,
+                        "existing_channel_name": existing_channel.name,
+                    },
+                )
                 await interaction.response.send_message(
                     f"You already have an open support ticket: {existing_channel.mention}",
                     ephemeral=True,
@@ -965,12 +1490,24 @@ class DiscordPurchaseBot(discord.Client):
 
             try:
                 ticket_channel = await self.create_support_ticket_channel(category, member)
-            except Exception:
+            except Exception as exc:
                 self.logger.exception(
                     "support_ticket_channel_create_failed guild_id=%s user_id=%s timestamp=%s",
                     guild.id,
                     member.id,
                     utc_timestamp(),
+                )
+                await self.audit_purchase_event(
+                    "support_ticket_open_failed",
+                    event_category="support",
+                    status="failure",
+                    trigger="button_press",
+                    interaction=interaction,
+                    actor_user_id=member.id,
+                    ticket_owner_id=member.id,
+                    button_custom_id=button_custom_id,
+                    error=exc,
+                    failure_reason="support ticket channel creation failed",
                 )
                 await interaction.response.send_message(
                     "I couldn't create your support ticket right now. Please try again shortly.",
@@ -985,6 +1522,32 @@ class DiscordPurchaseBot(discord.Client):
             member.id,
             utc_timestamp(),
         )
+        await self.audit_purchase_event(
+            "support_ticket_opened",
+            event_category="support",
+            status="success",
+            trigger="button_press",
+            channel=ticket_channel,
+            interaction=interaction,
+            actor_user_id=member.id,
+            ticket_owner_id=member.id,
+            button_custom_id=button_custom_id,
+        )
+        await self.audit_purchase_event(
+            "support_escalation_triggered",
+            event_category="support",
+            status="success",
+            trigger="button_press",
+            channel=ticket_channel,
+            interaction=interaction,
+            actor_user_id=member.id,
+            ticket_owner_id=member.id,
+            button_custom_id=button_custom_id,
+            details={
+                "support_channel_id": ticket_channel.id,
+                "support_channel_name": ticket_channel.name,
+            },
+        )
         await interaction.response.send_message(
             f"Your support ticket is ready: {ticket_channel.mention}",
             ephemeral=True,
@@ -992,7 +1555,25 @@ class DiscordPurchaseBot(discord.Client):
 
     async def handle_payment_button(self, interaction: discord.Interaction) -> None:
         channel = interaction.channel
+        button_custom_id = self.interaction_custom_id(interaction)
+        await self.audit_purchase_event(
+            "confirm_payment_button_pressed",
+            event_category="interaction",
+            status="success",
+            trigger="button_press",
+            interaction=interaction,
+            button_custom_id=button_custom_id,
+        )
         if not isinstance(channel, discord.TextChannel) or not self.is_purchase_ticket_channel(channel):
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="button used outside purchase ticket channel",
+            )
             await interaction.response.send_message(
                 "This button only works inside a ticket channel.",
                 ephemeral=True,
@@ -1001,6 +1582,16 @@ class DiscordPurchaseBot(discord.Client):
 
         owner_id = await self.get_authoritative_ticket_owner_id(channel)
         if owner_id is None:
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="ticket owner could not be resolved",
+            )
             await interaction.response.send_message(
                 "I couldn't verify the ticket owner from saved state. Please contact support.",
                 ephemeral=True,
@@ -1008,6 +1599,17 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         if owner_id is not None and interaction.user.id != owner_id:
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                button_custom_id=button_custom_id,
+                failure_reason="non-owner attempted to confirm payment",
+            )
             await interaction.response.send_message(
                 "Only the ticket owner can confirm payment here.",
                 ephemeral=True,
@@ -1027,6 +1629,19 @@ class DiscordPurchaseBot(discord.Client):
         )
 
         if ticket_stage == TICKET_STAGE_COMPLETED:
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="ignored",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                button_custom_id=button_custom_id,
+                failure_reason="ticket already completed",
+            )
             await interaction.response.send_message(
                 "Payment has already been confirmed for this ticket.",
                 ephemeral=True,
@@ -1034,6 +1649,19 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         if ticket_stage == TICKET_STAGE_AWAITING_PAYMENT_PLATFORM:
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                button_custom_id=button_custom_id,
+                failure_reason="payment platform not chosen",
+            )
             await interaction.response.send_message(
                 "Choose a payment platform first before checking payment.",
                 ephemeral=True,
@@ -1044,6 +1672,18 @@ class DiscordPurchaseBot(discord.Client):
             TICKET_STAGE_AWAITING_PAYMENT,
             TICKET_STAGE_PAYMENT_PENDING,
         }:
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                button_custom_id=button_custom_id,
+                failure_reason="script selection not ready for payment confirmation",
+            )
             await interaction.response.send_message(
                 "Confirm your script selection first before checking payment.",
                 ephemeral=True,
@@ -1051,6 +1691,19 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         if not payment_note_code:
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                button_custom_id=button_custom_id,
+                failure_reason="payment note code missing",
+            )
             await interaction.response.send_message(
                 "This ticket is missing its required payment note code. Choose the payment platform again to get the exact code before confirming payment.",
                 ephemeral=True,
@@ -1058,17 +1711,33 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         if channel.id in self.pending_payment_check_channel_ids:
+            await self.audit_purchase_event(
+                "confirm_payment_rejected",
+                event_category="payment",
+                status="ignored",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                button_custom_id=button_custom_id,
+                failure_reason="payment check already running",
+            )
             await interaction.response.send_message(
                 "A payment check is already running for this ticket.",
                 ephemeral=True,
             )
             return
 
+        previous_ticket_stage = ticket_stage
         await self.update_ticket_record(
             channel.id,
             owner_id=owner_id,
             stage=TICKET_STAGE_PAYMENT_PENDING,
         )
+        updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
         self.pending_payment_check_channel_ids.add(channel.id)
         confirm_pressed_at_utc = datetime.now(timezone.utc)
         task = asyncio.create_task(
@@ -1080,6 +1749,40 @@ class DiscordPurchaseBot(discord.Client):
         )
         self.payment_check_tasks.add(task)
         task.add_done_callback(self.cleanup_payment_task)
+        await self.audit_purchase_event(
+            "payment_check_scheduled",
+            event_category="payment",
+            status="scheduled",
+            trigger="button_press",
+            channel=channel,
+            interaction=interaction,
+            ticket_owner_id=owner_id,
+            ticket_record=updated_ticket_record,
+            product=selected_product,
+            payment_note_code=payment_note_code,
+            button_custom_id=button_custom_id,
+            previous_ticket_stage=previous_ticket_stage,
+            next_ticket_stage=TICKET_STAGE_PAYMENT_PENDING,
+            details={
+                "delay_seconds": PAYMENT_CHECK_DELAY_SECONDS,
+                "confirm_pressed_at_utc": confirm_pressed_at_utc.isoformat(),
+            },
+        )
+        await self.audit_stage_transition(
+            trigger="button_press",
+            channel=channel,
+            interaction=interaction,
+            ticket_owner_id=owner_id,
+            ticket_record=updated_ticket_record,
+            previous_ticket_stage=previous_ticket_stage,
+            next_ticket_stage=TICKET_STAGE_PAYMENT_PENDING,
+            product=selected_product,
+            payment_note_code=payment_note_code,
+            button_custom_id=button_custom_id,
+            details={
+                "delay_seconds": PAYMENT_CHECK_DELAY_SECONDS,
+            },
+        )
         try:
             await interaction.response.send_message(
                 (
@@ -1117,7 +1820,27 @@ class DiscordPurchaseBot(discord.Client):
         platform_key: str,
     ) -> None:
         channel = interaction.channel
+        button_custom_id = self.interaction_custom_id(interaction)
+        await self.audit_purchase_event(
+            "payment_platform_button_pressed",
+            event_category="interaction",
+            status="success",
+            trigger="button_press",
+            interaction=interaction,
+            button_custom_id=button_custom_id,
+            details={"requested_platform_key": platform_key},
+        )
         if not isinstance(channel, discord.TextChannel) or not self.is_purchase_ticket_channel(channel):
+            await self.audit_purchase_event(
+                "payment_platform_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="button used outside purchase ticket channel",
+                details={"requested_platform_key": platform_key},
+            )
             await interaction.response.send_message(
                 "This button only works inside a ticket channel.",
                 ephemeral=True,
@@ -1126,6 +1849,17 @@ class DiscordPurchaseBot(discord.Client):
 
         owner_id = await self.get_authoritative_ticket_owner_id(channel)
         if owner_id is None:
+            await self.audit_purchase_event(
+                "payment_platform_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                button_custom_id=button_custom_id,
+                failure_reason="ticket owner could not be resolved",
+                details={"requested_platform_key": platform_key},
+            )
             await interaction.response.send_message(
                 "I couldn't verify the ticket owner from saved state. Please contact support.",
                 ephemeral=True,
@@ -1133,6 +1867,18 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         if interaction.user.id != owner_id:
+            await self.audit_purchase_event(
+                "payment_platform_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                button_custom_id=button_custom_id,
+                failure_reason="non-owner attempted to choose payment platform",
+                details={"requested_platform_key": platform_key},
+            )
             await interaction.response.send_message(
                 "Only the ticket owner can choose the payment platform here.",
                 ephemeral=True,
@@ -1141,6 +1887,18 @@ class DiscordPurchaseBot(discord.Client):
 
         selected_platform = get_payment_platform_by_key(platform_key)
         if selected_platform is None:
+            await self.audit_purchase_event(
+                "payment_platform_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                button_custom_id=button_custom_id,
+                failure_reason="requested payment platform unavailable",
+                details={"requested_platform_key": platform_key},
+            )
             await interaction.response.send_message(
                 "That payment platform isn't available right now.",
                 ephemeral=True,
@@ -1157,6 +1915,20 @@ class DiscordPurchaseBot(discord.Client):
         )
 
         if ticket_stage == TICKET_STAGE_COMPLETED:
+            await self.audit_purchase_event(
+                "payment_platform_rejected",
+                event_category="payment",
+                status="ignored",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                platform=selected_platform,
+                button_custom_id=button_custom_id,
+                failure_reason="ticket already completed",
+            )
             await interaction.response.send_message(
                 "Payment has already been confirmed for this ticket.",
                 ephemeral=True,
@@ -1164,6 +1936,20 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         if ticket_stage == TICKET_STAGE_PAYMENT_PENDING:
+            await self.audit_purchase_event(
+                "payment_platform_rejected",
+                event_category="payment",
+                status="ignored",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                platform=selected_platform,
+                button_custom_id=button_custom_id,
+                failure_reason="payment check already running",
+            )
             await interaction.response.send_message(
                 "A payment check is already running for this ticket.",
                 ephemeral=True,
@@ -1174,6 +1960,19 @@ class DiscordPurchaseBot(discord.Client):
             TICKET_STAGE_AWAITING_PAYMENT_PLATFORM,
             TICKET_STAGE_AWAITING_PAYMENT,
         }:
+            await self.audit_purchase_event(
+                "payment_platform_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                platform=selected_platform,
+                button_custom_id=button_custom_id,
+                failure_reason="script selection not ready for payment platform choice",
+            )
             await interaction.response.send_message(
                 "Confirm your script selection first before choosing a payment platform.",
                 ephemeral=True,
@@ -1184,6 +1983,7 @@ class DiscordPurchaseBot(discord.Client):
             channel.id,
             owner_id=owner_id,
         )
+        previous_ticket_stage = ticket_stage
 
         try:
             await interaction.response.send_message(
@@ -1195,13 +1995,29 @@ class DiscordPurchaseBot(discord.Client):
                 view=self.build_payment_confirmation_view(),
                 allowed_mentions=self.response_allowed_mentions,
             )
-        except discord.DiscordException:
+        except discord.DiscordException as exc:
             self.logger.exception(
                 "ticket_payment_instructions_send_failed channel_id=%s user_id=%s platform=%s timestamp=%s",
                 channel.id,
                 interaction.user.id,
                 selected_platform.key,
                 utc_timestamp(),
+            )
+            await self.audit_purchase_event(
+                "payment_instructions_failed",
+                event_category="payment",
+                status="failure",
+                trigger="button_press",
+                channel=channel,
+                interaction=interaction,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                platform=selected_platform,
+                payment_note_code=payment_note_code,
+                button_custom_id=button_custom_id,
+                error=exc,
+                failure_reason="payment instructions send failed",
             )
             if not interaction.response.is_done():
                 try:
@@ -1220,6 +2036,7 @@ class DiscordPurchaseBot(discord.Client):
             payment_note_code=payment_note_code,
             stage=TICKET_STAGE_AWAITING_PAYMENT,
         )
+        updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
         self.logger.info(
             "ticket_payment_platform_selected channel_id=%s user_id=%s script=%s platform=%s timestamp=%s",
             channel.id,
@@ -1227,6 +2044,49 @@ class DiscordPurchaseBot(discord.Client):
             selected_product.key,
             selected_platform.key,
             utc_timestamp(),
+        )
+        await self.audit_purchase_event(
+            "payment_platform_chosen",
+            event_category="payment",
+            status="success",
+            trigger="button_press",
+            channel=channel,
+            interaction=interaction,
+            ticket_owner_id=owner_id,
+            ticket_record=updated_ticket_record,
+            product=selected_product,
+            platform=selected_platform,
+            payment_note_code=payment_note_code,
+            button_custom_id=button_custom_id,
+        )
+        await self.audit_purchase_event(
+            "payment_instructions_issued",
+            event_category="payment",
+            status="success",
+            trigger="button_press",
+            channel=channel,
+            interaction=interaction,
+            ticket_owner_id=owner_id,
+            ticket_record=updated_ticket_record,
+            product=selected_product,
+            platform=selected_platform,
+            payment_note_code=payment_note_code,
+            button_custom_id=button_custom_id,
+            previous_ticket_stage=previous_ticket_stage,
+            next_ticket_stage=TICKET_STAGE_AWAITING_PAYMENT,
+        )
+        await self.audit_stage_transition(
+            trigger="button_press",
+            channel=channel,
+            interaction=interaction,
+            ticket_owner_id=owner_id,
+            ticket_record=updated_ticket_record,
+            previous_ticket_stage=previous_ticket_stage,
+            next_ticket_stage=TICKET_STAGE_AWAITING_PAYMENT,
+            product=selected_product,
+            platform=selected_platform,
+            payment_note_code=payment_note_code,
+            button_custom_id=button_custom_id,
         )
 
     async def run_payment_confirmation_check(
@@ -1249,8 +2109,28 @@ class DiscordPurchaseBot(discord.Client):
             cast(str | None, ticket_record.get("selected_script_key"))
         )
         payment_note_code = cast(str | None, ticket_record.get("payment_note_code"))
+        pending_ticket_stage = cast(
+            str,
+            ticket_record.get("stage", TICKET_STAGE_PAYMENT_PENDING),
+        )
         parser_result: PaymentParserResult | None = None
         message_text = "payment check failed right now"
+        await self.audit_purchase_event(
+            "payment_check_started",
+            event_category="payment",
+            status="in_progress",
+            trigger="scheduled_task",
+            channel=channel,
+            actor_user_id=user_id,
+            ticket_owner_id=user_id,
+            ticket_record=ticket_record,
+            product=selected_product,
+            payment_note_code=payment_note_code,
+            details={
+                "delay_seconds": PAYMENT_CHECK_DELAY_SECONDS,
+                "confirm_pressed_at_utc": confirm_pressed_at_utc.isoformat(),
+            },
+        )
 
         try:
             await asyncio.sleep(PAYMENT_CHECK_DELAY_SECONDS)
@@ -1311,7 +2191,38 @@ class DiscordPurchaseBot(discord.Client):
                 [] if parser_result is None else parser_result.get("forwarding_flags", []),
                 utc_timestamp(),
             )
-        except Exception:
+            await self.audit_purchase_event(
+                "payment_email_check_result",
+                event_category="payment",
+                status=(
+                    "success"
+                    if parser_result is not None and parser_result.get("matched") is True
+                    else "failure"
+                ),
+                trigger="payment_parser",
+                channel=channel,
+                actor_user_id=user_id,
+                ticket_owner_id=user_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                gmail_message_id=(
+                    cast(str | None, parser_result.get("gmail_message_id"))
+                    if parser_result is not None
+                    else None
+                ),
+                failure_reason=(
+                    cast(str | None, parser_result.get("reason"))
+                    if parser_result is not None and parser_result.get("matched") is False
+                    else ""
+                ),
+                details={
+                    "parser_result": parser_result,
+                    "confirm_pressed_at_utc": confirm_pressed_at_utc.isoformat(),
+                    "expected_amount": str(expected_amount),
+                },
+            )
+        except Exception as exc:
             self.logger.exception(
                 "payment_check_failed channel_id=%s user_id=%s timestamp=%s",
                 channel.id,
@@ -1322,20 +2233,90 @@ class DiscordPurchaseBot(discord.Client):
                 channel.id,
                 stage=TICKET_STAGE_AWAITING_PAYMENT,
             )
+            updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            await self.audit_purchase_event(
+                "payment_check_failed",
+                event_category="exception",
+                status="failure",
+                trigger="scheduled_task",
+                channel=channel,
+                actor_user_id=user_id,
+                ticket_owner_id=user_id,
+                ticket_record=updated_ticket_record,
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                error=exc,
+                failure_reason="unexpected exception during payment check",
+            )
+            await self.audit_stage_transition(
+                trigger="scheduled_task",
+                channel=channel,
+                actor_user_id=user_id,
+                ticket_owner_id=user_id,
+                ticket_record=updated_ticket_record,
+                previous_ticket_stage=pending_ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_PAYMENT,
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                error=exc,
+            )
         finally:
             self.pending_payment_check_channel_ids.discard(channel.id)
 
         if parser_result is not None and parser_result.get("matched") is True:
+            await self.audit_purchase_event(
+                "payment_verified",
+                event_category="payment",
+                status="success",
+                trigger="payment_parser",
+                channel=channel,
+                actor_user_id=user_id,
+                ticket_owner_id=user_id,
+                ticket_record=ticket_record,
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                details={"parser_result": parser_result},
+            )
             if selected_product is None:
                 await self.update_ticket_record(
                     channel.id,
                     stage=TICKET_STAGE_PAYMENT_PENDING,
                 )
+                pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                 message_text = (
                     "Payment was confirmed, but I couldn't determine which script was "
                     "selected. Please contact support."
                 )
+                await self.audit_purchase_event(
+                    "support_escalation_triggered",
+                    event_category="support",
+                    status="failure",
+                    trigger="payment_verification",
+                    channel=channel,
+                    actor_user_id=user_id,
+                    ticket_owner_id=user_id,
+                    ticket_record=pending_ticket_record,
+                    payment_note_code=payment_note_code,
+                    gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                    failure_reason="verified payment but selected product was missing",
+                    details={"parser_result": parser_result},
+                )
             else:
+                await self.audit_purchase_event(
+                    "file_delivery_attempted",
+                    event_category="delivery",
+                    status="in_progress",
+                    trigger="payment_verification",
+                    channel=channel,
+                    actor_user_id=user_id,
+                    ticket_owner_id=user_id,
+                    ticket_record=ticket_record,
+                    product=selected_product,
+                    payment_note_code=payment_note_code,
+                    gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                    delivery_filename=selected_product.file_path.name,
+                )
                 try:
                     await channel.send(
                         (
@@ -1349,13 +2330,55 @@ class DiscordPurchaseBot(discord.Client):
                         channel.id,
                         stage=TICKET_STAGE_COMPLETED,
                     )
+                    completed_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+                    await self.audit_purchase_event(
+                        "file_delivery_succeeded",
+                        event_category="delivery",
+                        status="success",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=completed_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        delivery_filename=selected_product.file_path.name,
+                    )
+                    await self.audit_purchase_event(
+                        "ticket_marked_completed",
+                        event_category="ticket",
+                        status="success",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=completed_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        previous_ticket_stage=pending_ticket_stage,
+                        next_ticket_stage=TICKET_STAGE_COMPLETED,
+                    )
+                    await self.audit_stage_transition(
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=completed_ticket_record,
+                        previous_ticket_stage=pending_ticket_stage,
+                        next_ticket_stage=TICKET_STAGE_COMPLETED,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        details={"parser_result": parser_result},
+                    )
                     await self.record_successful_purchase(
                         channel,
                         user_id,
                         selected_product,
                     )
                     return
-                except FileNotFoundError:
+                except FileNotFoundError as exc:
                     self.logger.exception(
                         "ticket_script_file_missing channel_id=%s user_id=%s script=%s file_path=%s timestamp=%s",
                         channel.id,
@@ -1368,11 +2391,43 @@ class DiscordPurchaseBot(discord.Client):
                         channel.id,
                         stage=TICKET_STAGE_PAYMENT_PENDING,
                     )
+                    pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                     message_text = (
                         "Payment was confirmed, but the delivery file is missing right "
                         "now. Please contact support."
                     )
-                except (OSError, discord.DiscordException):
+                    await self.audit_purchase_event(
+                        "file_delivery_failed",
+                        event_category="delivery",
+                        status="failure",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=pending_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        delivery_filename=selected_product.file_path.name,
+                        error=exc,
+                        failure_reason="delivery file missing",
+                    )
+                    await self.audit_purchase_event(
+                        "support_escalation_triggered",
+                        event_category="support",
+                        status="failure",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=pending_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        delivery_filename=selected_product.file_path.name,
+                        failure_reason="delivery file missing after verified payment",
+                    )
+                except (OSError, discord.DiscordException) as exc:
                     self.logger.exception(
                         "ticket_script_delivery_failed channel_id=%s user_id=%s script=%s timestamp=%s",
                         channel.id,
@@ -1384,11 +2439,43 @@ class DiscordPurchaseBot(discord.Client):
                         channel.id,
                         stage=TICKET_STAGE_PAYMENT_PENDING,
                     )
+                    pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                     message_text = (
                         "Payment was confirmed, but I couldn't send the delivery file right "
                         "now. Please contact support."
                     )
-                except Exception:
+                    await self.audit_purchase_event(
+                        "file_delivery_failed",
+                        event_category="delivery",
+                        status="failure",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=pending_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        delivery_filename=selected_product.file_path.name,
+                        error=exc,
+                        failure_reason="delivery send failed",
+                    )
+                    await self.audit_purchase_event(
+                        "support_escalation_triggered",
+                        event_category="support",
+                        status="failure",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=pending_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        delivery_filename=selected_product.file_path.name,
+                        failure_reason="delivery send failed after verified payment",
+                    )
+                except Exception as exc:
                     self.logger.exception(
                         "payment_success_flow_failed channel_id=%s user_id=%s script=%s timestamp=%s",
                         channel.id,
@@ -1400,28 +2487,117 @@ class DiscordPurchaseBot(discord.Client):
                         channel.id,
                         stage=TICKET_STAGE_PAYMENT_PENDING,
                     )
+                    pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                     message_text = (
                         "Payment was confirmed, but I couldn't finish the delivery flow right "
                         "now. Please contact support."
+                    )
+                    await self.audit_purchase_event(
+                        "file_delivery_failed",
+                        event_category="delivery",
+                        status="failure",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=pending_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        delivery_filename=selected_product.file_path.name,
+                        error=exc,
+                        failure_reason="unexpected exception during delivery flow",
+                    )
+                    await self.audit_purchase_event(
+                        "support_escalation_triggered",
+                        event_category="support",
+                        status="failure",
+                        trigger="payment_verification",
+                        channel=channel,
+                        actor_user_id=user_id,
+                        ticket_owner_id=user_id,
+                        ticket_record=pending_ticket_record,
+                        product=selected_product,
+                        payment_note_code=payment_note_code,
+                        gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                        delivery_filename=selected_product.file_path.name,
+                        failure_reason="unexpected exception after verified payment",
                     )
         elif parser_result is not None and parser_result.get("matched") is False:
             await self.update_ticket_record(
                 channel.id,
                 stage=TICKET_STAGE_AWAITING_PAYMENT,
             )
+            awaiting_payment_record = await self.get_ticket_record_snapshot(channel.id)
             message_text = self.build_payment_parser_failure_message(parser_result)
+            await self.audit_purchase_event(
+                "payment_rejected",
+                event_category="payment",
+                status="failure",
+                trigger="payment_parser",
+                channel=channel,
+                actor_user_id=user_id,
+                ticket_owner_id=user_id,
+                ticket_record=awaiting_payment_record,
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                failure_reason=cast(str | None, parser_result.get("reason")) or "payment not found",
+                details={"parser_result": parser_result},
+            )
+            await self.audit_stage_transition(
+                trigger="payment_parser",
+                channel=channel,
+                actor_user_id=user_id,
+                ticket_owner_id=user_id,
+                ticket_record=awaiting_payment_record,
+                previous_ticket_stage=pending_ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_PAYMENT,
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                details={"parser_result": parser_result},
+            )
+            if "support ticket" in message_text.lower() or "contact support" in message_text.lower():
+                await self.audit_purchase_event(
+                    "support_escalation_triggered",
+                    event_category="support",
+                    status="failure",
+                    trigger="payment_parser",
+                    channel=channel,
+                    actor_user_id=user_id,
+                    ticket_owner_id=user_id,
+                    ticket_record=awaiting_payment_record,
+                    product=selected_product,
+                    payment_note_code=payment_note_code,
+                    gmail_message_id=cast(str | None, parser_result.get("gmail_message_id")),
+                    failure_reason=cast(str | None, parser_result.get("reason")) or "payment rejected",
+                )
 
         try:
             await channel.send(
                 message_text,
                 allowed_mentions=self.response_allowed_mentions,
             )
-        except discord.DiscordException:
+        except discord.DiscordException as exc:
             self.logger.exception(
                 "payment_check_message_send_failed channel_id=%s user_id=%s timestamp=%s",
                 channel.id,
                 user_id,
                 utc_timestamp(),
+            )
+            await self.audit_purchase_event(
+                "payment_check_result_message_failed",
+                event_category="exception",
+                status="failure",
+                trigger="bot_reply",
+                channel=channel,
+                actor_user_id=user_id,
+                ticket_owner_id=user_id,
+                ticket_record=await self.get_ticket_record_snapshot(channel.id),
+                product=selected_product,
+                payment_note_code=payment_note_code,
+                error=exc,
+                failure_reason="payment result message send failed",
             )
 
     def persist_state(self) -> None:
@@ -1535,11 +2711,27 @@ class DiscordPurchaseBot(discord.Client):
         message: discord.Message,
         product: ScriptProduct,
     ) -> bool:
+        channel = message.channel if isinstance(message.channel, discord.TextChannel) else None
+        ticket_record = (
+            await self.get_ticket_record_snapshot(channel.id)
+            if channel is not None
+            else None
+        )
         try:
             await message.reply(
                 build_script_confirmation_message(product),
                 mention_author=False,
                 allowed_mentions=self.response_allowed_mentions,
+            )
+            await self.audit_purchase_event(
+                "selection_confirmation_prompted",
+                event_category="selection",
+                status="success",
+                trigger="bot_reply",
+                channel=channel,
+                message=message,
+                ticket_record=ticket_record,
+                product=product,
             )
             return True
         except discord.DiscordException:
@@ -1549,6 +2741,18 @@ class DiscordPurchaseBot(discord.Client):
                 message.author.id,
                 product.key,
                 utc_timestamp(),
+            )
+            await self.audit_purchase_event(
+                "selection_confirmation_prompt_failed",
+                event_category="selection",
+                status="failure",
+                trigger="bot_reply",
+                channel=channel,
+                message=message,
+                ticket_record=ticket_record,
+                product=product,
+                error=None,
+                failure_reason="discord send failed",
             )
             await self.send_response(
                 message,
@@ -1562,7 +2766,18 @@ class DiscordPurchaseBot(discord.Client):
         selected_product = get_script_product_by_key(
             cast(str | None, ticket_record.get("selected_script_key"))
         )
+        channel = message.channel if isinstance(message.channel, discord.TextChannel) else None
         if selected_product is None:
+            await self.audit_purchase_event(
+                "payment_platform_prompt_failed",
+                event_category="payment",
+                status="failure",
+                trigger="bot_reply",
+                channel=channel,
+                message=message,
+                ticket_record=ticket_record,
+                failure_reason="selected product missing",
+            )
             await self.send_response(
                 message,
                 "I couldn't determine which script you selected. Please choose the script again.",
@@ -1576,6 +2791,16 @@ class DiscordPurchaseBot(discord.Client):
                 view=self.build_payment_platform_selection_view(),
                 allowed_mentions=self.response_allowed_mentions,
             )
+            await self.audit_purchase_event(
+                "payment_platform_prompted",
+                event_category="payment",
+                status="success",
+                trigger="bot_reply",
+                channel=channel,
+                message=message,
+                ticket_record=ticket_record,
+                product=selected_product,
+            )
             return True
         except discord.DiscordException:
             self.logger.exception(
@@ -1584,44 +2809,22 @@ class DiscordPurchaseBot(discord.Client):
                 message.author.id,
                 utc_timestamp(),
             )
+            await self.audit_purchase_event(
+                "payment_platform_prompt_failed",
+                event_category="payment",
+                status="failure",
+                trigger="bot_reply",
+                channel=channel,
+                message=message,
+                ticket_record=ticket_record,
+                product=selected_product,
+                failure_reason="discord send failed",
+            )
             await self.send_response(
                 message,
                 "I couldn't send the payment platform options right now. Please try again shortly.",
             )
             return False
-
-    async def resolve_purchase_user_identity(
-        self,
-        channel: discord.TextChannel,
-        user_id: int,
-    ) -> tuple[str, str]:
-        member = channel.guild.get_member(user_id)
-        if member is not None:
-            username = member.name
-            display_name = member.display_name or username
-            return username, display_name
-
-        cached_user = self.get_user(user_id)
-        if cached_user is not None:
-            username = cached_user.name
-            display_name = getattr(cached_user, "display_name", username) or username
-            return username, display_name
-
-        try:
-            fetched_user = await self.fetch_user(user_id)
-        except discord.DiscordException:
-            self.logger.exception(
-                "purchase_log_user_lookup_failed channel_id=%s user_id=%s timestamp=%s",
-                channel.id,
-                user_id,
-                utc_timestamp(),
-            )
-            fallback_name = f"unknown-user-{user_id}"
-            return fallback_name, fallback_name
-
-        username = fetched_user.name
-        display_name = getattr(fetched_user, "display_name", username) or username
-        return username, display_name
 
     async def build_purchase_record(
         self,
@@ -1631,7 +2834,10 @@ class DiscordPurchaseBot(discord.Client):
         *,
         purchase_timestamp: str,
     ) -> PurchaseRecord:
-        username, display_name = await self.resolve_purchase_user_identity(channel, user_id)
+        username, display_name = await self.resolve_user_identity(
+            user_id,
+            guild=channel.guild,
+        )
         guild_id = channel.guild.id if channel.guild is not None else 0
         full_date = datetime.fromisoformat(purchase_timestamp).date().isoformat()
         return {
@@ -1676,6 +2882,22 @@ class DiscordPurchaseBot(discord.Client):
                     product.key,
                     purchase_record["Purchase Event ID"],
                     purchase_timestamp,
+                )
+                await self.audit_purchase_event(
+                    "purchase_record_processed",
+                    event_category="purchase_log",
+                    status="failure",
+                    trigger="post_delivery",
+                    channel=channel,
+                    actor_user_id=user_id,
+                    ticket_owner_id=user_id,
+                    ticket_stage=TICKET_STAGE_COMPLETED,
+                    product=product,
+                    purchase_event_id=purchase_record["Purchase Event ID"],
+                    failure_reason="purchase logger raised an unexpected exception",
+                    details={
+                        "recovery_path": str(self.purchase_logger.recovery_file),
+                    },
                 )
                 return
 
@@ -1723,12 +2945,45 @@ class DiscordPurchaseBot(discord.Client):
                 sheet_ok,
                 self.purchase_logger.recovery_file,
             )
+        await self.audit_purchase_event(
+            "purchase_record_processed",
+            event_category="purchase_log",
+            status=(
+                "failure"
+                if not queued_ok
+                else "warning"
+                if not (local_ok and sheet_ok)
+                else "success"
+            ),
+            trigger="post_delivery",
+            channel=channel,
+            actor_user_id=user_id,
+            ticket_owner_id=user_id,
+            ticket_stage=TICKET_STAGE_COMPLETED,
+            product=product,
+            purchase_event_id=purchase_record["Purchase Event ID"],
+            failure_reason=(
+                "recovery queue append failed"
+                if not queued_ok
+                else "purchase log sync incomplete"
+                if not (local_ok and sheet_ok)
+                else ""
+            ),
+            details={
+                "queued_ok": queued_ok,
+                "local_ok": local_ok,
+                "sheet_ok": sheet_ok,
+                "recovery_path": str(self.purchase_logger.recovery_file),
+                "purchase_log_path": str(self.purchase_logger.purchase_log_file),
+            },
+        )
 
     async def handle_ticket_prompt(self, message: discord.Message) -> None:
         channel = message.channel
         if not isinstance(channel, discord.TextChannel):
             return
 
+        normalized_input = normalize_text(message.content)
         owner_id = await self.get_authoritative_ticket_owner_id(
             channel,
         )
@@ -1738,6 +2993,15 @@ class DiscordPurchaseBot(discord.Client):
                 channel.id,
                 message.author.id,
                 utc_timestamp(),
+            )
+            await self.audit_purchase_event(
+                "ticket_owner_unresolved",
+                event_category="ticket",
+                status="failure",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                failure_reason="ticket owner could not be resolved",
             )
             await self.send_response(
                 message,
@@ -1751,6 +3015,18 @@ class DiscordPurchaseBot(discord.Client):
                 message.author.id,
                 owner_id,
                 utc_timestamp(),
+            )
+            await self.audit_purchase_event(
+                "ticket_message_ignored_non_owner",
+                event_category="ticket",
+                status="ignored",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+                failure_reason="message author is not the ticket owner",
             )
             return
 
@@ -1777,6 +3053,19 @@ class DiscordPurchaseBot(discord.Client):
         if ticket_stage == TICKET_STAGE_AWAITING_CONFIRMATION:
             if message_is_selection_confirmation(message.content):
                 if current_product is None:
+                    await self.audit_purchase_event(
+                        "selection_confirm_failed",
+                        event_category="selection",
+                        status="failure",
+                        trigger="user_message",
+                        channel=channel,
+                        message=message,
+                        ticket_owner_id=owner_id,
+                        ticket_record=ticket_record,
+                        raw_user_input=message.content,
+                        normalized_user_input=normalized_input,
+                        failure_reason="selected product missing during confirmation",
+                    )
                     await self.update_ticket_record(
                         channel.id,
                         owner_id=message.author.id,
@@ -1784,6 +3073,19 @@ class DiscordPurchaseBot(discord.Client):
                         payment_platform_key=None,
                         payment_note_code=None,
                         stage=TICKET_STAGE_AWAITING_SELECTION,
+                    )
+                    reset_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+                    await self.audit_stage_transition(
+                        trigger="user_message",
+                        channel=channel,
+                        message=message,
+                        ticket_owner_id=owner_id,
+                        ticket_record=reset_ticket_record,
+                        previous_ticket_stage=ticket_stage,
+                        next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+                        raw_user_input=message.content,
+                        normalized_user_input=normalized_input,
+                        failure_reason="selected product missing during confirmation",
                     )
                     await self.send_response(message, build_ticket_retry_message())
                     return
@@ -1798,6 +3100,7 @@ class DiscordPurchaseBot(discord.Client):
                     payment_note_code=None,
                     stage=TICKET_STAGE_AWAITING_PAYMENT_PLATFORM,
                 )
+                updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                 self.logger.info(
                     "ticket_selection_confirmed channel_id=%s user_id=%s script=%s timestamp=%s",
                     channel.id,
@@ -1805,10 +3108,64 @@ class DiscordPurchaseBot(discord.Client):
                     current_product.key,
                     utc_timestamp(),
                 )
+                await self.audit_purchase_event(
+                    "selection_confirmed",
+                    event_category="selection",
+                    status="success",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=updated_ticket_record,
+                    product=current_product,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    previous_ticket_stage=ticket_stage,
+                    next_ticket_stage=TICKET_STAGE_AWAITING_PAYMENT_PLATFORM,
+                )
+                await self.audit_stage_transition(
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=updated_ticket_record,
+                    previous_ticket_stage=ticket_stage,
+                    next_ticket_stage=TICKET_STAGE_AWAITING_PAYMENT_PLATFORM,
+                    product=current_product,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                )
                 return
 
-            selected_product = find_script_product(message.content)
+            selection_result = resolve_script_product_selection(message.content)
+            await self.audit_purchase_event(
+                "product_selection_attempted",
+                event_category="selection",
+                status="success",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+            )
+            selected_product = selection_result.product
             if selected_product is None:
+                await self.audit_purchase_event(
+                    "product_selection_failed",
+                    event_category="selection",
+                    status="failure",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason=selection_result.status,
+                    details={"candidate_keys": selection_result.candidate_keys},
+                )
                 await self.send_response(
                     message,
                     (
@@ -1826,6 +3183,7 @@ class DiscordPurchaseBot(discord.Client):
                 payment_note_code=None,
                 stage=TICKET_STAGE_AWAITING_CONFIRMATION,
             )
+            updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
             self.logger.info(
                 "ticket_selection_updated channel_id=%s user_id=%s script=%s timestamp=%s",
                 channel.id,
@@ -1833,11 +3191,38 @@ class DiscordPurchaseBot(discord.Client):
                 selected_product.key,
                 utc_timestamp(),
             )
+            await self.audit_purchase_event(
+                "product_selection_resolved",
+                event_category="selection",
+                status="success",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                product=selected_product,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+                details={"candidate_keys": selection_result.candidate_keys},
+            )
             await self.send_script_selection_confirmation(message, selected_product)
             return
 
         if ticket_stage == TICKET_STAGE_AWAITING_PAYMENT_PLATFORM:
             if current_product is None:
+                await self.audit_purchase_event(
+                    "ticket_state_reset",
+                    event_category="state",
+                    status="failure",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason="selected product missing while awaiting payment platform",
+                )
                 await self.update_ticket_record(
                     channel.id,
                     owner_id=message.author.id,
@@ -1845,6 +3230,19 @@ class DiscordPurchaseBot(discord.Client):
                     payment_platform_key=None,
                     payment_note_code=None,
                     stage=TICKET_STAGE_AWAITING_SELECTION,
+                )
+                reset_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+                await self.audit_stage_transition(
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=reset_ticket_record,
+                    previous_ticket_stage=ticket_stage,
+                    next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason="selected product missing while awaiting payment platform",
                 )
                 await self.send_response(message, build_ticket_retry_message())
                 return
@@ -1858,6 +3256,19 @@ class DiscordPurchaseBot(discord.Client):
             TICKET_STAGE_COMPLETED,
         }:
             if current_product is None:
+                await self.audit_purchase_event(
+                    "ticket_state_reset",
+                    event_category="state",
+                    status="failure",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason="selected product missing after confirmation",
+                )
                 await self.update_ticket_record(
                     channel.id,
                     owner_id=message.author.id,
@@ -1866,10 +3277,36 @@ class DiscordPurchaseBot(discord.Client):
                     payment_note_code=None,
                     stage=TICKET_STAGE_AWAITING_SELECTION,
                 )
+                reset_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+                await self.audit_stage_transition(
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=reset_ticket_record,
+                    previous_ticket_stage=ticket_stage,
+                    next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason="selected product missing after confirmation",
+                )
                 await self.send_response(message, build_ticket_retry_message())
                 return
 
             if ticket_stage == TICKET_STAGE_COMPLETED:
+                await self.audit_purchase_event(
+                    "completed_ticket_notice_issued",
+                    event_category="ticket",
+                    status="ignored",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    product=current_product,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                )
                 await self.send_response(
                     message,
                     f"Payment has already been confirmed for {current_product.label} in this ticket.",
@@ -1877,12 +3314,41 @@ class DiscordPurchaseBot(discord.Client):
                 return
 
             if ticket_stage == TICKET_STAGE_PAYMENT_PENDING:
+                await self.audit_purchase_event(
+                    "payment_check_pending_notice_issued",
+                    event_category="payment",
+                    status="ignored",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    product=current_product,
+                    payment_note_code=current_payment_note_code,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                )
                 await self.send_response(
                     message,
                     "A payment check is already running for this ticket.",
                 )
                 return
 
+            await self.audit_purchase_event(
+                "payment_status_reminder_issued",
+                event_category="payment",
+                status="success",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+            )
             await self.send_response(
                 message,
                 (
@@ -1898,7 +3364,20 @@ class DiscordPurchaseBot(discord.Client):
             )
             return
 
-        selected_product = find_script_product(message.content)
+        selection_result = resolve_script_product_selection(message.content)
+        await self.audit_purchase_event(
+            "product_selection_attempted",
+            event_category="selection",
+            status="success",
+            trigger="user_message",
+            channel=channel,
+            message=message,
+            ticket_owner_id=owner_id,
+            ticket_record=ticket_record,
+            raw_user_input=message.content,
+            normalized_user_input=normalized_input,
+        )
+        selected_product = selection_result.product
         if selected_product is None:
             self.logger.info(
                 "ticket_selection_unmatched channel_id=%s user_id=%s timestamp=%s content=%r",
@@ -1906,6 +3385,20 @@ class DiscordPurchaseBot(discord.Client):
                 message.author.id,
                 utc_timestamp(),
                 message.content,
+            )
+            await self.audit_purchase_event(
+                "product_selection_failed",
+                event_category="selection",
+                status="failure",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+                failure_reason=selection_result.status,
+                details={"candidate_keys": selection_result.candidate_keys},
             )
             await self.send_response(message, build_ticket_retry_message())
             return
@@ -1918,12 +3411,39 @@ class DiscordPurchaseBot(discord.Client):
             payment_note_code=None,
             stage=TICKET_STAGE_AWAITING_CONFIRMATION,
         )
+        updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
         self.logger.info(
             "ticket_selection_matched channel_id=%s user_id=%s script=%s timestamp=%s",
             channel.id,
             message.author.id,
             selected_product.key,
             utc_timestamp(),
+        )
+        await self.audit_purchase_event(
+            "product_selection_resolved",
+            event_category="selection",
+            status="success",
+            trigger="user_message",
+            channel=channel,
+            message=message,
+            ticket_owner_id=owner_id,
+            ticket_record=updated_ticket_record,
+            product=selected_product,
+            raw_user_input=message.content,
+            normalized_user_input=normalized_input,
+            details={"candidate_keys": selection_result.candidate_keys},
+        )
+        await self.audit_stage_transition(
+            trigger="user_message",
+            channel=channel,
+            message=message,
+            ticket_owner_id=owner_id,
+            ticket_record=updated_ticket_record,
+            previous_ticket_stage=ticket_stage,
+            next_ticket_stage=TICKET_STAGE_AWAITING_CONFIRMATION,
+            product=selected_product,
+            raw_user_input=message.content,
+            normalized_user_input=normalized_input,
         )
         await self.send_script_selection_confirmation(message, selected_product)
 
@@ -1932,7 +3452,24 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         if self.is_purchase_ticket_channel(message.channel):
-            await self.handle_ticket_prompt(message)
+            try:
+                await self.handle_ticket_prompt(message)
+            except Exception as exc:
+                channel = (
+                    message.channel
+                    if isinstance(message.channel, discord.TextChannel)
+                    else None
+                )
+                await self.report_purchase_flow_exception(
+                    event_type="purchase_message_exception",
+                    trigger="user_message",
+                    error=exc,
+                    channel=channel,
+                    message=message,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalize_text(message.content),
+                    failure_reason="purchase ticket message handling raised an unexpected exception",
+                )
             return
         if self.is_support_ticket_channel(message.channel):
             return
@@ -1954,4 +3491,5 @@ class DiscordPurchaseBot(discord.Client):
             self.payment_check_tasks.clear()
             self.pending_payment_check_channel_ids.clear()
 
+        self.audit_logger.close()
         await super().close()

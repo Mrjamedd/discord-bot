@@ -42,10 +42,39 @@ class PaymentPlatformButton(discord.ui.Button["PaymentPlatformSelectionView"]):
             self.platform_key,
         )
 
-class TicketLauncherView(discord.ui.View):
+
+class BotBoundView(discord.ui.View):
     def __init__(self, bot: "DiscordPurchaseBot") -> None:
         super().__init__(timeout=None)
         self.bot = bot
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        channel = (
+            interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+        )
+        await self.bot.report_purchase_flow_exception(
+            event_type="purchase_interaction_exception",
+            trigger="interaction_callback",
+            error=error,
+            channel=channel,
+            interaction=interaction,
+            button_custom_id=getattr(item, "custom_id", None),
+            failure_reason=f"{type(item).__name__} callback raised an unexpected exception",
+            details={
+                "view_class": type(self).__name__,
+                "item_class": type(item).__name__,
+            },
+        )
+
+
+class TicketLauncherView(BotBoundView):
+    def __init__(self, bot: "DiscordPurchaseBot") -> None:
+        super().__init__(bot)
 
     @discord.ui.button(
         label="Open Ticket",
@@ -59,10 +88,9 @@ class TicketLauncherView(discord.ui.View):
     ) -> None:
         await self.bot.handle_ticket_button(interaction)
 
-class SupportTicketLauncherView(discord.ui.View):
+class SupportTicketLauncherView(BotBoundView):
     def __init__(self, bot: "DiscordPurchaseBot") -> None:
-        super().__init__(timeout=None)
-        self.bot = bot
+        super().__init__(bot)
 
     @discord.ui.button(
         label="Open Support Ticket",
@@ -77,17 +105,16 @@ class SupportTicketLauncherView(discord.ui.View):
         await self.bot.handle_support_ticket_button(interaction)
 
 
-class PaymentPlatformSelectionView(discord.ui.View):
+class PaymentPlatformSelectionView(BotBoundView):
     def __init__(self, bot: "DiscordPurchaseBot") -> None:
-        super().__init__(timeout=None)
-        self.bot = bot
+        super().__init__(bot)
         for platform in PAYMENT_PLATFORMS:
             self.add_item(PaymentPlatformButton(bot=bot, platform=platform))
 
-class PaymentConfirmationView(discord.ui.View):
+
+class PaymentConfirmationView(BotBoundView):
     def __init__(self, bot: "DiscordPurchaseBot") -> None:
-        super().__init__(timeout=None)
-        self.bot = bot
+        super().__init__(bot)
 
     @discord.ui.button(
         label="Confirm Payment",
