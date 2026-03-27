@@ -61,23 +61,40 @@ class ScriptProductSelectionResult:
     candidate_keys: tuple[str, ...] = ()
 
 
+def build_catalog_line(
+    product: ScriptProduct,
+    *,
+    prefix: str,
+) -> str:
+    return (
+        f"{prefix}{product.label} - ${product.price} "
+        f"(delivery file: {product.file_path.name})"
+    )
+
+
 def build_panel_catalog_lines() -> str:
     return "\n".join(
-        f"- {product.label} — ${product.price}"
+        build_catalog_line(product, prefix="- ")
         for product in SCRIPT_PRODUCTS
     )
 
 
 def build_ticket_catalog_lines() -> str:
     return "\n".join(
-        f"{index}. {product.label} - ${product.price}"
+        build_catalog_line(product, prefix=f"{index}. ")
         for index, product in enumerate(SCRIPT_PRODUCTS, start=1)
+    )
+
+
+def build_script_selection_instruction() -> str:
+    return (
+        "Reply with the script's exact name, number, delivery filename, or a clear alias."
     )
 
 
 def build_ticket_panel_message() -> str:
     return (
-        "The available scripts and their prices are listed below.\n"
+        "The full asset-backed script catalog is listed below.\n"
         f"{build_panel_catalog_lines()}\n"
         "Press the button below to continue with purchase."
     )
@@ -90,25 +107,30 @@ def build_support_ticket_panel_message() -> str:
 def build_ticket_store_message(username: str) -> str:
     return (
         f"Welcome, {username}. This ticket can be used to purchase scripts.\n"
-        "Available scripts and prices:\n"
+        "Available scripts, prices, and delivery files:\n"
         f"{build_ticket_catalog_lines()}\n"
-        "Reply with the script's exact name, number, or a clear alias."
+        f"{build_script_selection_instruction()}"
     )
 
 
-def build_ticket_retry_message() -> str:
+def build_ticket_retry_message(*, include_confirmation_hint: bool = False) -> str:
+    confirmation_hint = (
+        f"\nType {CONFIRM_SELECTION_RESPONSE} to confirm and proceed if the current selection is already correct."
+        if include_confirmation_hint
+        else ""
+    )
     return (
         "I couldn't tell which script you want yet.\n"
-        "Available options:\n"
+        "Available scripts, prices, and delivery files:\n"
         f"{build_ticket_catalog_lines()}\n"
-        "Make sure you reply with the script's exact name, number, or a clear alias."
+        f"{build_script_selection_instruction()}{confirmation_hint}"
     )
 
 
 def build_script_confirmation_message(product: ScriptProduct) -> str:
     return (
         "Confirming this is the script you want:\n"
-        f"{product.label} - ${product.price}\n"
+        f"{product.label} - ${product.price} - delivery file: {product.file_path.name}\n"
         f"Type {CONFIRM_SELECTION_RESPONSE} to confirm and proceed."
     )
 

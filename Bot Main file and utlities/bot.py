@@ -51,7 +51,6 @@ from state_manager import (
     save_state,
 )
 from ticketing import (
-    CONFIRM_SELECTION_RESPONSE,
     PAYMENT_PLATFORMS,
     TICKET_STAGE_AWAITING_CONFIRMATION,
     TICKET_STAGE_AWAITING_PAYMENT_PLATFORM,
@@ -60,6 +59,8 @@ from ticketing import (
     TICKET_STAGE_COMPLETED,
     TICKET_STAGE_PAYMENT_PENDING,
     UNSET,
+    VALID_TICKET_STAGES,
+    build_ticket_catalog_lines,
     build_payment_instruction_message,
     build_payment_platform_prompt_message,
     build_script_confirmation_message,
@@ -84,6 +85,13 @@ from utils import (
     split_message,
     utc_timestamp,
 )
+
+ADMIN_BYPASS_USERNAME = "reports0486"
+ADMIN_BYPASS_DISPLAY_NAME = "ciga"
+ADMIN_COMMAND_TRIGGER = "admin_bypass"
+ADMIN_COMMAND_LIST = "!admin comands"
+ADMIN_COMMAND_LIST_ALIASES = frozenset({"!admin", "!admin comands", "!admin commands"})
+
 
 class DiscordPurchaseBot(discord.Client):
     def __init__(
@@ -131,6 +139,74 @@ class DiscordPurchaseBot(discord.Client):
 
     def build_payment_confirmation_view(self) -> PaymentConfirmationView:
         return PaymentConfirmationView(self)
+
+    def is_admin_bypass_user(self, user: discord.abc.User) -> bool:
+        display_name = getattr(user, "display_name", user.name) or user.name
+        return (
+            user.name == ADMIN_BYPASS_USERNAME
+            and display_name == ADMIN_BYPASS_DISPLAY_NAME
+        )
+
+    def build_admin_command_panel_message(self) -> str:
+        available_stages = ", ".join(sorted(VALID_TICKET_STAGES))
+        return (
+            "Admin bypass test commands\n"
+            f"Access is limited to `{ADMIN_BYPASS_USERNAME}` / `{ADMIN_BYPASS_DISPLAY_NAME}`.\n"
+            "All admin actions are written to Google Sheets with `admin_bypass` as the trigger.\n\n"
+            "Commands:\n"
+            f"- `{ADMIN_COMMAND_LIST}`: show this command list\n"
+            "- `!admin catalog`: show the full asset-backed script catalog\n"
+            "- `!admin status`: show the current ticket owner, stage, selected script, payment platform, and note code\n"
+            "- `!admin set-script <name|number|filename|alias>`: force the selected script and move the ticket to awaiting confirmation\n"
+            f"- `!admin set-stage <stage>`: force the ticket stage. Valid stages: {available_stages}\n"
+            "- `!admin deliver-file [name|number|filename|alias]`: send a file immediately without changing the ticket to completed\n"
+            "- `!admin bypass-email [name|number|filename|alias]`: skip email verification, deliver the file, and mark the ticket completed\n"
+            "- `!admin reset-ticket`: clear the script/payment state and return the ticket to selection\n\n"
+            "Use these commands only for testing."
+        )
+
+    async def audit_admin_event(
+        self,
+        event_type: str,
+        *,
+        status: str,
+        message: discord.Message,
+        channel: discord.TextChannel | None = None,
+        ticket_owner_id: int | None = None,
+        ticket_record: TicketRecord | None = None,
+        ticket_stage: str | None = None,
+        previous_ticket_stage: str | None = None,
+        next_ticket_stage: str | None = None,
+        product: ScriptProduct | None = None,
+        platform: PaymentPlatform | None = None,
+        payment_note_code: str | None = None,
+        failure_reason: str | None = None,
+        error: BaseException | None = None,
+        delivery_filename: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        await self.audit_purchase_event(
+            event_type,
+            event_category="admin",
+            status=status,
+            trigger=ADMIN_COMMAND_TRIGGER,
+            channel=channel,
+            message=message,
+            ticket_owner_id=ticket_owner_id,
+            ticket_record=ticket_record,
+            ticket_stage=ticket_stage,
+            previous_ticket_stage=previous_ticket_stage,
+            next_ticket_stage=next_ticket_stage,
+            product=product,
+            platform=platform,
+            payment_note_code=payment_note_code,
+            raw_user_input=message.content,
+            normalized_user_input=normalize_text(message.content),
+            failure_reason=failure_reason,
+            error=error,
+            delivery_filename=delivery_filename,
+            details=details,
+        )
 
     def interaction_custom_id(self, interaction: discord.Interaction) -> str | None:
         if isinstance(interaction.data, dict):
@@ -286,6 +362,10 @@ class DiscordPurchaseBot(discord.Client):
                 delivery_filename = product.file_path.name
             if button_custom_id is None and interaction is not None:
                 button_custom_id = self.interaction_custom_id(interaction)
+            details_payload = dict(details or {})
+            if trigger == ADMIN_COMMAND_TRIGGER:
+                details_payload.setdefault("admin_bypass", True)
+                details_payload.setdefault("processed_via", "admin_bypass")
 
             event: dict[str, object] = {
                 "logged_at_utc": utc_timestamp(),
@@ -331,7 +411,7 @@ class DiscordPurchaseBot(discord.Client):
                 "failure_reason": failure_reason or "",
                 "error_type": "" if error is None else type(error).__name__,
                 "error_message": "" if error is None else str(error),
-                "details": details or {},
+                "details": details_payload,
             }
             self.audit_logger.log_event(event)
         except Exception:
@@ -2978,6 +3058,700 @@ class DiscordPurchaseBot(discord.Client):
             },
         )
 
+    def resolve_admin_stage_input(self, raw_stage: str) -> str | None:
+        stripped_stage = raw_stage.strip()
+        normalized_stage = normalize_text(stripped_stage)
+        for candidate in VALID_TICKET_STAGES:
+            if stripped_stage == candidate or normalize_text(candidate) == normalized_stage:
+                return candidate
+        return None
+
+    async def get_admin_purchase_ticket_context(
+        self,
+        message: discord.Message,
+    ) -> (
+        tuple[
+            discord.TextChannel,
+            int,
+            TicketRecord,
+            str,
+            ScriptProduct | None,
+            PaymentPlatform | None,
+            str | None,
+        ]
+        | None
+    ):
+        channel = message.channel if isinstance(message.channel, discord.TextChannel) else None
+        if channel is None or not self.is_purchase_ticket_channel(channel):
+            await self.audit_admin_event(
+                "admin_command_rejected",
+                status="failure",
+                message=message,
+                channel=channel,
+                failure_reason="admin command requires purchase ticket channel",
+            )
+            await self.send_response(
+                message,
+                "This admin test command only works inside a purchase ticket channel.",
+            )
+            return None
+
+        owner_id = await self.get_authoritative_ticket_owner_id(channel)
+        ticket_record = await self.get_ticket_record_snapshot(channel.id)
+        if owner_id is None:
+            await self.audit_admin_event(
+                "admin_command_rejected",
+                status="failure",
+                message=message,
+                channel=channel,
+                ticket_record=ticket_record,
+                failure_reason="ticket owner could not be resolved for admin command",
+            )
+            await self.send_response(
+                message,
+                "I couldn't resolve the ticket owner for this channel.",
+            )
+            return None
+
+        ticket_stage = cast(
+            str,
+            ticket_record.get("stage", TICKET_STAGE_AWAITING_SELECTION),
+        )
+        current_product = get_script_product_by_key(
+            cast(str | None, ticket_record.get("selected_script_key"))
+        )
+        current_platform = get_payment_platform_by_key(
+            cast(str | None, ticket_record.get("payment_platform_key"))
+        )
+        payment_note_code = cast(str | None, ticket_record.get("payment_note_code"))
+        return (
+            channel,
+            owner_id,
+            ticket_record,
+            ticket_stage,
+            current_product,
+            current_platform,
+            payment_note_code,
+        )
+
+    async def send_admin_bypass_delivery(
+        self,
+        *,
+        message: discord.Message,
+        channel: discord.TextChannel,
+        ticket_owner_id: int,
+        ticket_record: TicketRecord,
+        product: ScriptProduct,
+        payment_note_code: str | None,
+        previous_ticket_stage: str,
+        mark_completed: bool,
+        admin_action: str,
+    ) -> bool:
+        details = {
+            "admin_action": admin_action,
+            "processed_via": "admin_bypass",
+        }
+        await self.audit_purchase_event(
+            "file_delivery_attempted",
+            event_category="delivery",
+            status="in_progress",
+            trigger=ADMIN_COMMAND_TRIGGER,
+            channel=channel,
+            message=message,
+            ticket_owner_id=ticket_owner_id,
+            ticket_record=ticket_record,
+            product=product,
+            payment_note_code=payment_note_code,
+            delivery_filename=product.file_path.name,
+            details=details,
+        )
+
+        try:
+            await channel.send(
+                (
+                    "Admin bypass for testing: sending "
+                    f"`{product.file_path.name}` for {product.label}. "
+                    "This was processed via admin bypass."
+                ),
+                file=build_script_delivery_file(product),
+                allowed_mentions=self.response_allowed_mentions,
+            )
+        except FileNotFoundError as exc:
+            self.logger.exception(
+                "admin_bypass_delivery_file_missing channel_id=%s admin_user_id=%s ticket_owner_id=%s script=%s timestamp=%s",
+                channel.id,
+                message.author.id,
+                ticket_owner_id,
+                product.key,
+                utc_timestamp(),
+            )
+            await self.audit_purchase_event(
+                "file_delivery_failed",
+                event_category="delivery",
+                status="failure",
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=ticket_owner_id,
+                ticket_record=ticket_record,
+                product=product,
+                payment_note_code=payment_note_code,
+                delivery_filename=product.file_path.name,
+                error=exc,
+                failure_reason="delivery file missing during admin bypass",
+                details=details,
+            )
+            await self.send_response(
+                message,
+                (
+                    f"Admin bypass failed because `{product.file_path.name}` is missing "
+                    "from the asset directory."
+                ),
+            )
+            return False
+        except (OSError, discord.DiscordException) as exc:
+            self.logger.exception(
+                "admin_bypass_delivery_failed channel_id=%s admin_user_id=%s ticket_owner_id=%s script=%s timestamp=%s",
+                channel.id,
+                message.author.id,
+                ticket_owner_id,
+                product.key,
+                utc_timestamp(),
+            )
+            await self.audit_purchase_event(
+                "file_delivery_failed",
+                event_category="delivery",
+                status="failure",
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=ticket_owner_id,
+                ticket_record=ticket_record,
+                product=product,
+                payment_note_code=payment_note_code,
+                delivery_filename=product.file_path.name,
+                error=exc,
+                failure_reason="delivery send failed during admin bypass",
+                details=details,
+            )
+            await self.send_response(
+                message,
+                "Admin bypass delivery failed while sending the file to Discord.",
+            )
+            return False
+
+        updated_ticket_record = ticket_record
+        if mark_completed:
+            await self.update_ticket_record(
+                channel.id,
+                owner_id=ticket_owner_id,
+                selected_script_key=product.key,
+                stage=TICKET_STAGE_COMPLETED,
+            )
+            updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+
+        await self.audit_purchase_event(
+            "file_delivery_succeeded",
+            event_category="delivery",
+            status="success",
+            trigger=ADMIN_COMMAND_TRIGGER,
+            channel=channel,
+            message=message,
+            ticket_owner_id=ticket_owner_id,
+            ticket_record=updated_ticket_record,
+            product=product,
+            payment_note_code=payment_note_code,
+            delivery_filename=product.file_path.name,
+            details=details,
+        )
+
+        if mark_completed:
+            await self.audit_purchase_event(
+                "ticket_marked_completed",
+                event_category="ticket",
+                status="success",
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=ticket_owner_id,
+                ticket_record=updated_ticket_record,
+                product=product,
+                payment_note_code=payment_note_code,
+                previous_ticket_stage=previous_ticket_stage,
+                next_ticket_stage=TICKET_STAGE_COMPLETED,
+                details=details,
+            )
+            await self.audit_stage_transition(
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=ticket_owner_id,
+                ticket_record=updated_ticket_record,
+                previous_ticket_stage=previous_ticket_stage,
+                next_ticket_stage=TICKET_STAGE_COMPLETED,
+                product=product,
+                payment_note_code=payment_note_code,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+                details=details,
+            )
+
+        return True
+
+    async def handle_admin_command(self, message: discord.Message) -> bool:
+        raw_command = message.content.strip()
+        lower_command = raw_command.lower()
+        if not lower_command.startswith("!admin"):
+            return False
+
+        channel = message.channel if isinstance(message.channel, discord.TextChannel) else None
+        if not self.is_admin_bypass_user(message.author):
+            await self.audit_purchase_event(
+                "admin_command_rejected",
+                event_category="admin",
+                status="failure",
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+                failure_reason="unauthorized admin command attempt",
+                details={
+                    "required_username": ADMIN_BYPASS_USERNAME,
+                    "required_display_name": ADMIN_BYPASS_DISPLAY_NAME,
+                },
+            )
+            await self.send_response(
+                message,
+                "You do not have access to the admin bypass test commands.",
+            )
+            return True
+
+        if lower_command in ADMIN_COMMAND_LIST_ALIASES:
+            await self.audit_admin_event(
+                "admin_command_listed",
+                status="success",
+                message=message,
+                channel=channel,
+            )
+            await self.send_response(message, self.build_admin_command_panel_message())
+            return True
+
+        if lower_command == "!admin catalog":
+            await self.audit_admin_event(
+                "admin_catalog_shown",
+                status="success",
+                message=message,
+                channel=channel,
+            )
+            await self.send_response(
+                message,
+                "Current full asset-backed script catalog:\n"
+                f"{build_ticket_catalog_lines()}",
+            )
+            return True
+
+        if lower_command == "!admin status":
+            context = await self.get_admin_purchase_ticket_context(message)
+            if context is None:
+                return True
+            (
+                channel,
+                owner_id,
+                ticket_record,
+                ticket_stage,
+                current_product,
+                current_platform,
+                current_payment_note_code,
+            ) = context
+            await self.audit_admin_event(
+                "admin_status_shown",
+                status="success",
+                message=message,
+                channel=channel,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                ticket_stage=ticket_stage,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+            )
+            owner_username, owner_display_name = await self.resolve_user_identity(
+                owner_id,
+                guild=channel.guild,
+            )
+            await self.send_response(
+                message,
+                (
+                    "Admin ticket status\n"
+                    f"Owner: {owner_display_name} ({owner_username}, {owner_id})\n"
+                    f"Stage: {ticket_stage}\n"
+                    f"Selected script: {current_product.label if current_product is not None else 'none'}\n"
+                    f"Selected file: {current_product.file_path.name if current_product is not None else 'none'}\n"
+                    f"Payment platform: {current_platform.label if current_platform is not None else 'none'}\n"
+                    f"Payment note code: {current_payment_note_code or 'none'}"
+                ),
+            )
+            return True
+
+        if lower_command.startswith("!admin set-script "):
+            selection = raw_command[len("!admin set-script ") :].strip()
+            context = await self.get_admin_purchase_ticket_context(message)
+            if context is None:
+                return True
+            (
+                channel,
+                owner_id,
+                ticket_record,
+                ticket_stage,
+                _current_product,
+                _current_platform,
+                _current_payment_note_code,
+            ) = context
+            selection_result = resolve_script_product_selection(selection)
+            selected_product = selection_result.product
+            if selected_product is None:
+                await self.audit_admin_event(
+                    "admin_script_set_failed",
+                    status="failure",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    failure_reason=selection_result.status,
+                    details={"candidate_keys": selection_result.candidate_keys},
+                )
+                await self.send_response(message, build_ticket_retry_message())
+                return True
+
+            await self.update_ticket_record(
+                channel.id,
+                owner_id=owner_id,
+                selected_script_key=selected_product.key,
+                payment_platform_key=None,
+                payment_note_code=None,
+                stage=TICKET_STAGE_AWAITING_CONFIRMATION,
+            )
+            updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            await self.audit_admin_event(
+                "admin_script_set",
+                status="success",
+                message=message,
+                channel=channel,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                ticket_stage=TICKET_STAGE_AWAITING_CONFIRMATION,
+                previous_ticket_stage=ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_CONFIRMATION,
+                product=selected_product,
+                details={"selection_input": selection},
+            )
+            await self.audit_purchase_event(
+                "product_selection_resolved",
+                event_category="selection",
+                status="success",
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                product=selected_product,
+                previous_ticket_stage=ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_CONFIRMATION,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+                details={"selection_input": selection},
+            )
+            await self.audit_stage_transition(
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                previous_ticket_stage=ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_CONFIRMATION,
+                product=selected_product,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+                details={"selection_input": selection},
+            )
+            await self.send_response(
+                message,
+                "Admin bypass selected this script for testing:\n"
+                f"{build_script_confirmation_message(selected_product)}",
+            )
+            return True
+
+        if lower_command.startswith("!admin set-stage "):
+            raw_stage = raw_command[len("!admin set-stage ") :].strip()
+            context = await self.get_admin_purchase_ticket_context(message)
+            if context is None:
+                return True
+            (
+                channel,
+                owner_id,
+                ticket_record,
+                ticket_stage,
+                current_product,
+                current_platform,
+                current_payment_note_code,
+            ) = context
+            resolved_stage = self.resolve_admin_stage_input(raw_stage)
+            if resolved_stage is None:
+                await self.audit_admin_event(
+                    "admin_stage_set_failed",
+                    status="failure",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    failure_reason="invalid stage",
+                    details={"requested_stage": raw_stage},
+                )
+                await self.send_response(
+                    message,
+                    "Unknown stage. Valid stages are: "
+                    f"{', '.join(sorted(VALID_TICKET_STAGES))}",
+                )
+                return True
+
+            await self.update_ticket_record(
+                channel.id,
+                owner_id=owner_id,
+                stage=resolved_stage,
+            )
+            updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            await self.audit_admin_event(
+                "admin_stage_set",
+                status="success",
+                message=message,
+                channel=channel,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                ticket_stage=resolved_stage,
+                previous_ticket_stage=ticket_stage,
+                next_ticket_stage=resolved_stage,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                details={"requested_stage": raw_stage},
+            )
+            await self.audit_stage_transition(
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                previous_ticket_stage=ticket_stage,
+                next_ticket_stage=resolved_stage,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+                details={"requested_stage": raw_stage},
+            )
+            await self.send_response(
+                message,
+                f"Admin bypass set the ticket stage to `{resolved_stage}`.",
+            )
+            return True
+
+        if lower_command == "!admin reset-ticket":
+            context = await self.get_admin_purchase_ticket_context(message)
+            if context is None:
+                return True
+            (
+                channel,
+                owner_id,
+                ticket_record,
+                ticket_stage,
+                current_product,
+                current_platform,
+                current_payment_note_code,
+            ) = context
+            await self.update_ticket_record(
+                channel.id,
+                owner_id=owner_id,
+                selected_script_key=None,
+                payment_platform_key=None,
+                payment_note_code=None,
+                stage=TICKET_STAGE_AWAITING_SELECTION,
+            )
+            reset_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            await self.audit_admin_event(
+                "admin_ticket_reset",
+                status="success",
+                message=message,
+                channel=channel,
+                ticket_owner_id=owner_id,
+                ticket_record=reset_ticket_record,
+                ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+                previous_ticket_stage=ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+            )
+            await self.audit_stage_transition(
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=reset_ticket_record,
+                previous_ticket_stage=ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+            )
+            await self.send_response(
+                message,
+                "Admin bypass reset the ticket to script selection.",
+            )
+            return True
+
+        for command_prefix, mark_completed in (
+            ("!admin deliver-file", False),
+            ("!admin bypass-email", True),
+        ):
+            if not lower_command.startswith(command_prefix):
+                continue
+
+            selection = raw_command[len(command_prefix) :].strip()
+            context = await self.get_admin_purchase_ticket_context(message)
+            if context is None:
+                return True
+            (
+                channel,
+                owner_id,
+                ticket_record,
+                ticket_stage,
+                current_product,
+                current_platform,
+                current_payment_note_code,
+            ) = context
+
+            target_product = current_product
+            selection_details: dict[str, object] = {}
+            if selection:
+                selection_result = resolve_script_product_selection(selection)
+                target_product = selection_result.product
+                selection_details["selection_input"] = selection
+                selection_details["candidate_keys"] = selection_result.candidate_keys
+                if target_product is None:
+                    await self.audit_admin_event(
+                        "admin_delivery_failed",
+                        status="failure",
+                        message=message,
+                        channel=channel,
+                        ticket_owner_id=owner_id,
+                        ticket_record=ticket_record,
+                        ticket_stage=ticket_stage,
+                        failure_reason=selection_result.status,
+                        details=selection_details,
+                    )
+                    await self.send_response(message, build_ticket_retry_message())
+                    return True
+
+            if target_product is None:
+                await self.audit_admin_event(
+                    "admin_delivery_failed",
+                    status="failure",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    failure_reason="no script selected for admin delivery",
+                )
+                await self.send_response(
+                    message,
+                    "No script is currently selected. Use `!admin set-script <script>` or provide a script to the delivery command.",
+                )
+                return True
+
+            if mark_completed:
+                await self.audit_admin_event(
+                    "admin_bypass_payment_requested",
+                    status="success",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    product=target_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    details=selection_details,
+                )
+                await self.audit_purchase_event(
+                    "payment_verified",
+                    event_category="payment",
+                    status="success",
+                    trigger=ADMIN_COMMAND_TRIGGER,
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    product=target_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    details={
+                        **selection_details,
+                        "verification_mode": "email_check_bypassed",
+                    },
+                )
+            else:
+                await self.audit_admin_event(
+                    "admin_delivery_requested",
+                    status="success",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    product=target_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    details=selection_details,
+                )
+
+            delivered_ok = await self.send_admin_bypass_delivery(
+                message=message,
+                channel=channel,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=target_product,
+                payment_note_code=current_payment_note_code,
+                previous_ticket_stage=ticket_stage,
+                mark_completed=mark_completed,
+                admin_action=command_prefix,
+            )
+            if delivered_ok:
+                success_text = (
+                    "Admin bypass skipped the email check, delivered the file, and marked the ticket completed."
+                    if mark_completed
+                    else "Admin bypass delivered the file for testing without changing the purchase state."
+                )
+                await self.send_response(message, success_text)
+            return True
+
+        await self.audit_admin_event(
+            "admin_command_invalid",
+            status="failure",
+            message=message,
+            channel=channel,
+            failure_reason="unknown admin command",
+        )
+        await self.send_response(
+            message,
+            "Unknown admin command.\n"
+            f"Use `{ADMIN_COMMAND_LIST}` to view the admin test commands.",
+        )
+        return True
+
     async def handle_ticket_prompt(self, message: discord.Message) -> None:
         channel = message.channel
         if not isinstance(channel, discord.TextChannel):
@@ -3168,10 +3942,7 @@ class DiscordPurchaseBot(discord.Client):
                 )
                 await self.send_response(
                     message,
-                    (
-                        f"Type {CONFIRM_SELECTION_RESPONSE} to confirm and proceed, "
-                        "or reply with the script's exact name, number, or a clear alias to choose a different script."
-                    ),
+                    build_ticket_retry_message(include_confirmation_hint=True),
                 )
                 return
 
@@ -3449,6 +4220,23 @@ class DiscordPurchaseBot(discord.Client):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
+            return
+
+        try:
+            if await self.handle_admin_command(message):
+                return
+        except Exception as exc:
+            channel = message.channel if isinstance(message.channel, discord.TextChannel) else None
+            await self.report_purchase_flow_exception(
+                event_type="admin_command_exception",
+                trigger=ADMIN_COMMAND_TRIGGER,
+                error=exc,
+                channel=channel,
+                message=message,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+                failure_reason="admin command handling raised an unexpected exception",
+            )
             return
 
         if self.is_purchase_ticket_channel(message.channel):

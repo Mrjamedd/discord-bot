@@ -12,7 +12,11 @@ if str(MODULE_DIR) not in sys.path:
 
 from models import ScriptProduct
 from purchase_audit_logger import PURCHASE_AUDIT_COLUMNS, _build_purchase_audit_row
-from ticketing import resolve_script_product_selection
+from ticketing import (
+    build_ticket_catalog_lines,
+    build_ticket_retry_message,
+    resolve_script_product_selection,
+)
 
 
 class PurchaseAuditLoggingTests(unittest.TestCase):
@@ -43,6 +47,19 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
         self.assertEqual("golden-free-aim-v2", row[23])
         self.assertEqual("GOLDEN_FREE_v2.gpc", row[25])
         self.assertIn("candidate_keys", row[-1])
+
+    def test_ticket_catalog_lines_include_delivery_filenames(self) -> None:
+        catalog_lines = build_ticket_catalog_lines()
+
+        self.assertIn("CoreX Aim 2K26", catalog_lines)
+        self.assertIn("Corex-Aim_2K26.gpc", catalog_lines)
+        self.assertIn("delivery file:", catalog_lines)
+
+    def test_ticket_retry_message_can_include_confirmation_hint(self) -> None:
+        retry_message = build_ticket_retry_message(include_confirmation_hint=True)
+
+        self.assertIn("Type yes to confirm and proceed", retry_message)
+        self.assertIn("delivery filename", retry_message)
 
     def test_resolve_script_product_selection_reports_match(self) -> None:
         result = resolve_script_product_selection("golden free aim")
