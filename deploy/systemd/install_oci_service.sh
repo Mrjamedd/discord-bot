@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-SERVICE_NAME="${SERVICE_NAME:-discord-purchase-bot}"
+SERVICE_NAME="${SERVICE_NAME:-discordbot}"
 SERVICE_USER="${SERVICE_USER:-ubuntu}"
 SERVICE_GROUP="${SERVICE_GROUP:-$SERVICE_USER}"
 
@@ -17,7 +17,7 @@ AUTO_PIP_INSTALL="${AUTO_PIP_INSTALL:-1}"
 PYTHON_BIN="${PYTHON_BIN:-$INSTALL_DIR/venv/bin/python}"
 RUNNER_PATH="${RUNNER_PATH:-$INSTALL_DIR/run_bot.py}"
 START_SCRIPT_PATH="${START_SCRIPT_PATH:-$INSTALL_DIR/deploy/systemd/start_bot.sh}"
-UNIT_SOURCE="$SCRIPT_DIR/discord-purchase-bot.service"
+UNIT_SOURCE="$SCRIPT_DIR/discordbot.service"
 UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 
 if [[ "${EUID}" -ne 0 ]]; then

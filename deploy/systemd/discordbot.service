@@ -19,7 +19,7 @@ Environment=BOT_AUTO_PIP_INSTALL=1
 Environment=PYTHON_BIN=/opt/discord-purchase-bot/venv/bin/python
 Environment=RUNNER_PATH=/opt/discord-purchase-bot/run_bot.py
 ExecStart=/opt/discord-purchase-bot/deploy/systemd/start_bot.sh
-SyslogIdentifier=discord-purchase-bot
+SyslogIdentifier=discordbot
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure

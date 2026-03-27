@@ -85,9 +85,9 @@ The launcher reads a repo-local `.env` automatically and falls back to `$HOME/.e
 
 ## OCI VM Deployment
 
-Use `systemd` as the process manager on the OCI Ubuntu VM. That gives you automatic startup on boot, restart-on-failure, one place to inspect logs with `journalctl`, and a clean place to run the repo update step before the bot launches.
+Use `systemd` as the process manager on the OCI Ubuntu VM. The active unit name is `discordbot.service`, and it gives you automatic startup on boot, restart-on-failure, one place to inspect logs with `journalctl`, and a clean place to run the repo update step before the bot launches.
 
-1. Clone the repo onto the server. The default unit template assumes `/opt/discord-purchase-bot`, but the install helper can render the service for any absolute path.
+1. Clone the repo onto the server. The default `discordbot.service` template assumes `/opt/discord-purchase-bot`, but the install helper can render the service for any absolute path.
 2. Create the bot env file from `.env.example`. On OCI Ubuntu, the default service expects `/home/ubuntu/.env`.
 3. Create `/home/ubuntu/discord-bot/assets` and upload the four required `.gpc` files there.
 4. If you use Google Sheets on Ubuntu, prefer `GOOGLE_SHEETS_CREDENTIALS_JSON` in the env file so you do not need to mount a credentials file.
@@ -118,15 +118,15 @@ sudo ./deploy/systemd/install_oci_service.sh
 Useful service commands on the server:
 
 ```bash
-sudo systemctl status discord-purchase-bot
-sudo journalctl -u discord-purchase-bot -f
-sudo systemctl restart discord-purchase-bot
-sudo systemctl stop discord-purchase-bot
+sudo systemctl status discordbot
+sudo journalctl -u discordbot -f
+sudo systemctl restart discordbot
+sudo systemctl stop discordbot
 ```
 
 How startup works with the default unit:
 
-- `systemd` starts `deploy/systemd/start_bot.sh`
+- `discordbot.service` starts `deploy/systemd/start_bot.sh`
 - the wrapper verifies that `/home/ubuntu/discord-bot/assets` exists, is readable, is not empty, and still contains the required delivery files
 - it verifies the repo is on `main` and clean
 - it fetches `origin/main` and fast-forwards the local checkout when remote changes exist

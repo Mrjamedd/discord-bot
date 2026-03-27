@@ -29,6 +29,7 @@ venv/
 # Runtime data and credentials
 runtime/
 credentials/
+/assets/
 
 # Editor and OS junk
 .DS_Store

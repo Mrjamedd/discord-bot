@@ -61,7 +61,7 @@ if [[ "$current_branch" != "$BOT_GIT_BRANCH" ]]; then
 fi
 
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
-  log "Refusing to auto-update because the repository is not clean."
+  log "Refusing to auto-update because the repository is not clean. Tracked edits or unignored local files are present."
   git status --short
   exit 1
 fi
@@ -81,6 +81,9 @@ if [[ "$local_head" != "$remote_head" ]]; then
 else
   log "Repository already up to date on $BOT_GIT_BRANCH"
 fi
+
+current_head="$(git rev-parse HEAD)"
+log "Repository ready at commit $current_head"
 
 if [[ "$BOT_AUTO_PIP_INSTALL" == "1" ]]; then
   if (( requirements_changed )); then
