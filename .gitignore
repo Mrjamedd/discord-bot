@@ -30,6 +30,7 @@ venv/
 runtime/
 credentials/
 /assets/
+local_testing/
 
 # Editor and OS junk
 .DS_Store

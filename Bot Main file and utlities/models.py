@@ -30,6 +30,8 @@ class PaymentParserResult(TypedDict, total=False):
     gmail_message_id: str | None
     from_address: str | None
     from_domain: str | None
+    allowed_sender_domains: list[str]
+    allowed_sender_subdomains: list[str]
     amount: str | None
     expected_amount: str | None
     amount_shortfall: str | None

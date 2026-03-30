@@ -2719,6 +2719,16 @@ class DiscordPurchaseBot(discord.Client):
         parser_result: PaymentParserResult,
     ) -> str:
         reason = cast(str, parser_result.get("reason", "payment not detected yet"))
+        from_domain = cast(str | None, parser_result.get("from_domain"))
+        allowed_sender_domains = cast(
+            list[str] | None,
+            parser_result.get("allowed_sender_domains"),
+        ) or []
+        allowed_sender_subdomains = cast(
+            list[str] | None,
+            parser_result.get("allowed_sender_subdomains"),
+        ) or []
+        auth_summary = cast(str | None, parser_result.get("auth_summary"))
         if reason == "no candidate messages found":
             return (
                 "Payment was not detected in the recent inbox window yet. If you just paid, "
@@ -2737,6 +2747,25 @@ class DiscordPurchaseBot(discord.Client):
                     f"The receipt email did not contain the required payment code `{payment_note}`. "
                     "Send payment with that exact code in the note or open a support ticket for manual review."
                 )
+        if reason == "sender domain not allowed":
+            allowed_text = ", ".join(allowed_sender_domains) if allowed_sender_domains else "the approved list"
+            if from_domain:
+                return (
+                    f"Automatic payment confirmation rejected the sender domain `{from_domain}`. "
+                    f"Allowed sender domains are `{allowed_text}`. If the payment was real, open a support ticket for manual review."
+                )
+        if reason == "sender subdomain not explicitly approved":
+            allowed_text = ", ".join(allowed_sender_subdomains) if allowed_sender_subdomains else "the approved subdomain list"
+            if from_domain:
+                return (
+                    f"Automatic payment confirmation rejected the sender subdomain `{from_domain}`. "
+                    f"Approved sender subdomains are `{allowed_text}`. If the payment was real, open a support ticket for manual review."
+                )
+        if reason == "authentication failure" and auth_summary:
+            return (
+                f"Automatic payment confirmation could not verify the sender authentication ({auth_summary}). "
+                "If the payment was real, open a support ticket for manual review."
+            )
         if reason == "amount short":
             shortfall = cast(str | None, parser_result.get("amount_shortfall"))
             if shortfall:
