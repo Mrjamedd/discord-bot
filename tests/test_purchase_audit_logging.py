@@ -13,8 +13,13 @@ if str(MODULE_DIR) not in sys.path:
 from models import ScriptProduct
 from purchase_audit_logger import PURCHASE_AUDIT_COLUMNS, _build_purchase_audit_row
 from ticketing import (
+    PURCHASE_TICKET_AUTO_CLOSE_MINUTES,
+    build_ticket_change_script_message,
     build_ticket_catalog_lines,
     build_ticket_retry_message,
+    build_ticket_store_message,
+    message_requests_script_change,
+    message_requests_ticket_close,
     resolve_script_product_selection,
 )
 
@@ -61,6 +66,30 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
 
         self.assertIn("Type yes to confirm and proceed", retry_message)
         self.assertIn("delivery filename", retry_message)
+
+    def test_ticket_store_message_includes_change_and_close_note(self) -> None:
+        ticket_store_message = build_ticket_store_message("tester")
+
+        self.assertIn("`change script`", ticket_store_message)
+        self.assertIn("`close ticket`", ticket_store_message)
+        self.assertIn(
+            f"{PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes",
+            ticket_store_message,
+        )
+
+    def test_ticket_change_script_message_repeats_management_note(self) -> None:
+        change_script_message = build_ticket_change_script_message()
+
+        self.assertIn(
+            "Your current script selection has been cleared",
+            change_script_message,
+        )
+        self.assertIn("`change script`", change_script_message)
+        self.assertIn("`close ticket`", change_script_message)
+
+    def test_ticket_management_commands_are_normalized(self) -> None:
+        self.assertTrue(message_requests_script_change("Change Script"))
+        self.assertTrue(message_requests_ticket_close("CLOSE TICKET"))
 
     def test_resolve_script_product_selection_reports_match(self) -> None:
         result = resolve_script_product_selection("golden free aim")

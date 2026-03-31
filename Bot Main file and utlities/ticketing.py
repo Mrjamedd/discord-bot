@@ -32,6 +32,10 @@ PAYMENT_PLATFORMS = (
 PAYMENT_PLATFORMS_BY_KEY: dict[str, PaymentPlatform] = {
     platform.key: platform for platform in PAYMENT_PLATFORMS
 }
+CHANGE_SCRIPT_COMMAND = "change script"
+CLOSE_TICKET_COMMAND = "close ticket"
+PURCHASE_TICKET_AUTO_CLOSE_MINUTES = 30
+PURCHASE_TICKET_AUTO_CLOSE_DELAY_SECONDS = PURCHASE_TICKET_AUTO_CLOSE_MINUTES * 60
 LEGACY_SCRIPT_PRODUCT_KEY_MAP: dict[str, str] = {
     "secret-script": "secret-of-scripts-v6",
     "infinante-stamina": "golden-free-aim-v2",
@@ -104,12 +108,21 @@ def build_support_ticket_panel_message() -> str:
     return SUPPORT_TICKET_PANEL_MESSAGE
 
 
+def build_ticket_management_note() -> str:
+    return (
+        f'Need a different script before delivery? Type `{CHANGE_SCRIPT_COMMAND}`.\n'
+        f'If you want to start over completely, type `{CLOSE_TICKET_COMMAND}` to close this purchase ticket and then open a new one.\n'
+        f"Completed purchase tickets close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery."
+    )
+
+
 def build_ticket_store_message(username: str) -> str:
     return (
         f"Welcome, {username}. This ticket can be used to purchase scripts.\n"
         "Available scripts, prices, and delivery files:\n"
         f"{build_ticket_catalog_lines()}\n"
-        f"{build_script_selection_instruction()}"
+        f"{build_script_selection_instruction()}\n\n"
+        f"{build_ticket_management_note()}"
     )
 
 
@@ -124,6 +137,16 @@ def build_ticket_retry_message(*, include_confirmation_hint: bool = False) -> st
         "Available scripts, prices, and delivery files:\n"
         f"{build_ticket_catalog_lines()}\n"
         f"{build_script_selection_instruction()}{confirmation_hint}"
+    )
+
+
+def build_ticket_change_script_message() -> str:
+    return (
+        "Your current script selection has been cleared.\n"
+        "Available scripts, prices, and delivery files:\n"
+        f"{build_ticket_catalog_lines()}\n"
+        f"{build_script_selection_instruction()}\n\n"
+        f"{build_ticket_management_note()}"
     )
 
 
@@ -276,6 +299,14 @@ def get_payment_platform_by_key(platform_key: str | None) -> PaymentPlatform | N
 
 def message_is_selection_confirmation(message_content: str) -> bool:
     return normalize_text(message_content) == CONFIRM_SELECTION_RESPONSE
+
+
+def message_requests_script_change(message_content: str) -> bool:
+    return normalize_text(message_content) == CHANGE_SCRIPT_COMMAND
+
+
+def message_requests_ticket_close(message_content: str) -> bool:
+    return normalize_text(message_content) == CLOSE_TICKET_COMMAND
 
 
 def build_script_delivery_file(product: ScriptProduct) -> discord.File:

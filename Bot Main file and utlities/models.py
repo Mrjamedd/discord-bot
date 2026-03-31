@@ -10,6 +10,7 @@ class TicketRecord(TypedDict, total=False):
     selected_script_key: str | None
     payment_platform_key: str | None
     payment_note_code: str | None
+    auto_close_at_utc: str | None
     stage: str
 
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import subprocess
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
@@ -52,6 +54,8 @@ from state_manager import (
 )
 from ticketing import (
     PAYMENT_PLATFORMS,
+    PURCHASE_TICKET_AUTO_CLOSE_DELAY_SECONDS,
+    PURCHASE_TICKET_AUTO_CLOSE_MINUTES,
     TICKET_STAGE_AWAITING_CONFIRMATION,
     TICKET_STAGE_AWAITING_PAYMENT_PLATFORM,
     TICKET_STAGE_AWAITING_PAYMENT,
@@ -60,6 +64,7 @@ from ticketing import (
     TICKET_STAGE_PAYMENT_PENDING,
     UNSET,
     VALID_TICKET_STAGES,
+    build_ticket_change_script_message,
     build_ticket_catalog_lines,
     build_payment_instruction_message,
     build_payment_platform_prompt_message,
@@ -74,6 +79,8 @@ from ticketing import (
     generate_payment_note_code,
     get_payment_platform_by_key,
     get_script_product_by_key,
+    message_requests_script_change,
+    message_requests_ticket_close,
     message_is_selection_confirmation,
     resolve_script_product_selection,
     ticket_owner_id_from_topic,
@@ -89,8 +96,53 @@ from utils import (
 ADMIN_BYPASS_USERNAME = "reports0486"
 ADMIN_BYPASS_DISPLAY_NAME = "ciga"
 ADMIN_COMMAND_TRIGGER = "admin_bypass"
-ADMIN_COMMAND_LIST = "!admin comands"
-ADMIN_COMMAND_LIST_ALIASES = frozenset({"!admin", "!admin comands", "!admin commands"})
+ADMIN_COMMAND_LIST = "!admin help"
+ADMIN_COMMAND_LIST_ALIASES = frozenset(
+    {
+        "!admin",
+        "!admin help",
+        "!admin menu",
+        "!admin commands",
+        "!admin command",
+        "!admin list",
+        "!admin test",
+        "!admin test commands",
+        "!admin comands",
+    }
+)
+ADMIN_CATALOG_COMMAND_ALIASES = frozenset(
+    {"!admin catalog", "!admin scripts", "!admin script catalog"}
+)
+ADMIN_STATUS_COMMAND_ALIASES = frozenset(
+    {"!admin status", "!admin ticket", "!admin ticket status"}
+)
+ADMIN_VERSION_COMMAND_ALIASES = frozenset(
+    {"!admin version", "!admin build", "!admin bot version"}
+)
+ADMIN_SET_SCRIPT_COMMAND_PREFIXES = (
+    "!admin set-script",
+    "!admin set script",
+    "!admin script",
+)
+ADMIN_SET_STAGE_COMMAND_PREFIXES = (
+    "!admin set-stage",
+    "!admin set stage",
+    "!admin stage",
+)
+ADMIN_RESET_COMMAND_ALIASES = frozenset(
+    {"!admin reset-ticket", "!admin reset", "!admin reset ticket", "!admin start over"}
+)
+ADMIN_DELIVER_COMMAND_PREFIXES = (
+    "!admin deliver-file",
+    "!admin deliver file",
+    "!admin deliver",
+)
+ADMIN_BYPASS_COMMAND_PREFIXES = (
+    "!admin bypass-email",
+    "!admin bypass email",
+    "!admin bypass",
+)
+BOT_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiscordPurchaseBot(discord.Client):
@@ -126,6 +178,7 @@ class DiscordPurchaseBot(discord.Client):
         self.pending_payment_check_channel_ids: set[int] = set()
         self.purchase_sync_lock = asyncio.Lock()
         self.purchase_sync_retry_task: asyncio.Task[None] | None = None
+        self.purchase_ticket_auto_close_tasks: dict[int, asyncio.Task[None]] = {}
         self.payment_parser_lock = asyncio.Lock()
 
     def build_ticket_panel_view(self) -> TicketLauncherView:
@@ -150,20 +203,70 @@ class DiscordPurchaseBot(discord.Client):
     def build_admin_command_panel_message(self) -> str:
         available_stages = ", ".join(sorted(VALID_TICKET_STAGES))
         return (
-            "Admin bypass test commands\n"
+            "Admin test command menu\n"
             f"Access is limited to `{ADMIN_BYPASS_USERNAME}` / `{ADMIN_BYPASS_DISPLAY_NAME}`.\n"
             "All admin actions are written to Google Sheets with `admin_bypass` as the trigger.\n\n"
-            "Commands:\n"
-            f"- `{ADMIN_COMMAND_LIST}`: show this command list\n"
-            "- `!admin catalog`: show the full asset-backed script catalog\n"
+            "Quick help aliases:\n"
+            "- `!admin`\n"
+            "- `!admin help`\n"
+            "- `!admin menu`\n"
+            "- `!admin commands`\n\n"
+            "Read-only:\n"
             "- `!admin status`: show the current ticket owner, stage, selected script, payment platform, and note code\n"
-            "- `!admin set-script <name|number|filename|alias>`: force the selected script and move the ticket to awaiting confirmation\n"
-            f"- `!admin set-stage <stage>`: force the ticket stage. Valid stages: {available_stages}\n"
-            "- `!admin deliver-file [name|number|filename|alias]`: send a file immediately without changing the ticket to completed\n"
-            "- `!admin bypass-email [name|number|filename|alias]`: skip email verification, deliver the file, and mark the ticket completed\n"
-            "- `!admin reset-ticket`: clear the script/payment state and return the ticket to selection\n\n"
-            "Use these commands only for testing."
+            "- `!admin catalog`: show the full asset-backed script catalog\n"
+            "- `!admin version`: show the deployed bot version, tag, and commit\n\n"
+            "Control:\n"
+            "- `!admin script <name|number|filename|alias>`: set the selected script and move the ticket to awaiting confirmation\n"
+            f"- `!admin stage <stage>`: force the ticket stage. Valid stages: {available_stages}\n"
+            "- `!admin reset`: clear the script/payment state and return the ticket to selection\n"
+            "- `!admin deliver [name|number|filename|alias]`: send a file immediately without changing the ticket to completed\n"
+            "- `!admin bypass [name|number|filename|alias]`: skip email verification, deliver the file, and mark the ticket completed\n\n"
+            "Legacy command names still work."
         )
+
+    def admin_command_argument(
+        self,
+        raw_command: str,
+        lower_command: str,
+        prefixes: tuple[str, ...],
+    ) -> str | None:
+        for prefix in prefixes:
+            if lower_command == prefix:
+                return ""
+            prefixed_with_space = f"{prefix} "
+            if lower_command.startswith(prefixed_with_space):
+                return raw_command[len(prefix) :].strip()
+        return None
+
+    def run_git_version_command(self, *args: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=BOT_REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+        output = completed.stdout.strip()
+        return output or None
+
+    def build_admin_version_message(self) -> str:
+        description = self.run_git_version_command("describe", "--tags", "--dirty", "--always")
+        branch = self.run_git_version_command("rev-parse", "--abbrev-ref", "HEAD")
+        commit = self.run_git_version_command("rev-parse", "--short", "HEAD")
+
+        if description is None and branch is None and commit is None:
+            return "Bot version\nVersion information is unavailable on this deployment."
+
+        lines = ["Bot version"]
+        lines.append(f"Version: {description or 'unknown'}")
+        lines.append(f"Branch: {branch or 'unknown'}")
+        lines.append(f"Commit: {commit or 'unknown'}")
+        return "\n".join(lines)
 
     async def audit_admin_event(
         self,
@@ -626,6 +729,290 @@ class DiscordPurchaseBot(discord.Client):
         except asyncio.CancelledError:
             return
 
+    async def get_existing_ticket_record(
+        self,
+        channel_id: int,
+    ) -> TicketRecord | None:
+        async with self.state_lock:
+            tickets = self.state.get("tickets")
+            if not isinstance(tickets, dict):
+                return None
+            record = tickets.get(str(channel_id))
+            if not isinstance(record, dict):
+                return None
+            return cast(TicketRecord, dict(record))
+
+    async def remove_ticket_record(self, channel_id: int) -> None:
+        async with self.state_lock:
+            tickets = self.state.get("tickets")
+            if not isinstance(tickets, dict):
+                return
+            if tickets.pop(str(channel_id), None) is not None:
+                self.persist_state()
+
+    def parse_utc_datetime(self, raw_value: object) -> datetime | None:
+        if not isinstance(raw_value, str):
+            return None
+        stripped_value = raw_value.strip()
+        if not stripped_value:
+            return None
+
+        try:
+            parsed = datetime.fromisoformat(stripped_value)
+        except ValueError:
+            return None
+
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def build_purchase_ticket_auto_close_deadline(
+        self,
+        *,
+        now_utc: datetime | None = None,
+    ) -> str:
+        scheduled_time = (
+            now_utc or datetime.now(timezone.utc)
+        ) + timedelta(seconds=PURCHASE_TICKET_AUTO_CLOSE_DELAY_SECONDS)
+        return scheduled_time.isoformat()
+
+    def cancel_purchase_ticket_auto_close_task(self, channel_id: int) -> None:
+        task = self.purchase_ticket_auto_close_tasks.pop(channel_id, None)
+        if task is not None:
+            task.cancel()
+
+    def cleanup_purchase_ticket_auto_close_task(
+        self,
+        channel_id: int,
+        completed: asyncio.Future[None],
+    ) -> None:
+        current_task = self.purchase_ticket_auto_close_tasks.get(channel_id)
+        if current_task is completed:
+            self.purchase_ticket_auto_close_tasks.pop(channel_id, None)
+        if completed.cancelled():
+            return
+        try:
+            completed.result()
+        except Exception:
+            self.logger.exception(
+                "purchase_ticket_auto_close_task_failed channel_id=%s timestamp=%s",
+                channel_id,
+                utc_timestamp(),
+            )
+
+    async def schedule_purchase_ticket_auto_close(
+        self,
+        channel: discord.TextChannel,
+        *,
+        auto_close_at_utc: str | None = None,
+    ) -> str | None:
+        resolved_auto_close_at_utc = (
+            auto_close_at_utc or self.build_purchase_ticket_auto_close_deadline()
+        )
+        if self.parse_utc_datetime(resolved_auto_close_at_utc) is None:
+            return None
+
+        await self.update_ticket_record(
+            channel.id,
+            auto_close_at_utc=resolved_auto_close_at_utc,
+        )
+        self.cancel_purchase_ticket_auto_close_task(channel.id)
+        task = asyncio.create_task(
+            self.run_purchase_ticket_auto_close(
+                channel.id,
+                auto_close_at_utc=resolved_auto_close_at_utc,
+            )
+        )
+        self.purchase_ticket_auto_close_tasks[channel.id] = task
+        task.add_done_callback(
+            lambda completed, channel_id=channel.id: self.cleanup_purchase_ticket_auto_close_task(
+                channel_id,
+                completed,
+            )
+        )
+        return resolved_auto_close_at_utc
+
+    async def restore_purchase_ticket_auto_close_tasks(self) -> None:
+        async with self.state_lock:
+            tickets = self.state.get("tickets")
+            saved_records = (
+                [
+                    (channel_id, cast(TicketRecord, dict(record)))
+                    for channel_id, record in tickets.items()
+                    if isinstance(channel_id, str) and isinstance(record, dict)
+                ]
+                if isinstance(tickets, dict)
+                else []
+            )
+
+        for channel_id_value, ticket_record in saved_records:
+            if cast(str | None, ticket_record.get("stage")) != TICKET_STAGE_COMPLETED:
+                continue
+
+            try:
+                channel_id = int(channel_id_value)
+            except ValueError:
+                continue
+
+            auto_close_at_utc = cast(str | None, ticket_record.get("auto_close_at_utc"))
+            if not auto_close_at_utc:
+                auto_close_at_utc = self.build_purchase_ticket_auto_close_deadline()
+
+            channel = self.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                try:
+                    fetched_channel = await self.fetch_channel(channel_id)
+                except discord.NotFound:
+                    await self.remove_ticket_record(channel_id)
+                    continue
+                except discord.DiscordException:
+                    self.logger.exception(
+                        "purchase_ticket_auto_close_channel_fetch_failed channel_id=%s timestamp=%s",
+                        channel_id,
+                        utc_timestamp(),
+                    )
+                    continue
+                if not isinstance(fetched_channel, discord.TextChannel):
+                    continue
+                channel = fetched_channel
+
+            if not self.is_purchase_ticket_channel(channel):
+                continue
+
+            await self.schedule_purchase_ticket_auto_close(
+                channel,
+                auto_close_at_utc=auto_close_at_utc,
+            )
+
+    async def close_purchase_ticket_channel(
+        self,
+        channel: discord.TextChannel,
+        *,
+        delete_reason: str,
+        closing_message: str | None = None,
+        grace_period_seconds: int = 0,
+        cancel_scheduled_close: bool = True,
+    ) -> bool:
+        if cancel_scheduled_close:
+            self.cancel_purchase_ticket_auto_close_task(channel.id)
+
+        if closing_message:
+            try:
+                await channel.send(
+                    closing_message,
+                    allowed_mentions=self.response_allowed_mentions,
+                )
+            except discord.DiscordException:
+                self.logger.exception(
+                    "purchase_ticket_close_notice_failed channel_id=%s timestamp=%s",
+                    channel.id,
+                    utc_timestamp(),
+                )
+
+        if grace_period_seconds > 0:
+            await asyncio.sleep(grace_period_seconds)
+
+        try:
+            await channel.delete(reason=delete_reason)
+        except discord.NotFound:
+            await self.remove_ticket_record(channel.id)
+            self.logger.info(
+                "purchase_ticket_channel_already_deleted channel_id=%s timestamp=%s",
+                channel.id,
+                utc_timestamp(),
+            )
+            return True
+        except discord.DiscordException:
+            self.logger.exception(
+                "purchase_ticket_channel_delete_failed channel_id=%s timestamp=%s",
+                channel.id,
+                utc_timestamp(),
+            )
+            return False
+
+        await self.remove_ticket_record(channel.id)
+        self.logger.info(
+            "purchase_ticket_channel_deleted channel_id=%s timestamp=%s",
+            channel.id,
+            utc_timestamp(),
+        )
+        return True
+
+    async def run_purchase_ticket_auto_close(
+        self,
+        channel_id: int,
+        *,
+        auto_close_at_utc: str,
+    ) -> None:
+        auto_close_at = self.parse_utc_datetime(auto_close_at_utc)
+        if auto_close_at is None:
+            return
+
+        remaining_seconds = (
+            auto_close_at - datetime.now(timezone.utc)
+        ).total_seconds()
+        if remaining_seconds > 0:
+            await asyncio.sleep(remaining_seconds)
+
+        ticket_record = await self.get_existing_ticket_record(channel_id)
+        if ticket_record is None:
+            return
+
+        if cast(str | None, ticket_record.get("stage")) != TICKET_STAGE_COMPLETED:
+            return
+
+        if cast(str | None, ticket_record.get("auto_close_at_utc")) != auto_close_at_utc:
+            return
+
+        channel = self.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            try:
+                fetched_channel = await self.fetch_channel(channel_id)
+            except discord.NotFound:
+                await self.remove_ticket_record(channel_id)
+                return
+            except discord.DiscordException:
+                self.logger.exception(
+                    "purchase_ticket_auto_close_channel_fetch_failed channel_id=%s timestamp=%s",
+                    channel_id,
+                    utc_timestamp(),
+                )
+                return
+            if not isinstance(fetched_channel, discord.TextChannel):
+                return
+            channel = fetched_channel
+
+        if not self.is_purchase_ticket_channel(channel):
+            return
+
+        owner_id = cast(int | None, ticket_record.get("owner_id"))
+        product = get_script_product_by_key(
+            cast(str | None, ticket_record.get("selected_script_key"))
+        )
+        closed_ok = await self.close_purchase_ticket_channel(
+            channel,
+            delete_reason="Auto-close completed purchase ticket after delivery window",
+            closing_message=(
+                "This purchase ticket is now closing automatically. "
+                "You can open a new ticket from the panel any time you want another script."
+            ),
+            grace_period_seconds=5,
+            cancel_scheduled_close=False,
+        )
+        await self.audit_purchase_event(
+            "purchase_ticket_auto_closed",
+            event_category="ticket",
+            status="success" if closed_ok else "failure",
+            trigger="scheduled_task",
+            channel=channel,
+            actor_user_id=owner_id,
+            ticket_owner_id=owner_id,
+            ticket_record=ticket_record,
+            product=product,
+            failure_reason="" if closed_ok else "automatic purchase ticket close failed",
+            details={"auto_close_at_utc": auto_close_at_utc},
+        )
+
     async def get_authoritative_ticket_owner_id(
         self,
         channel: discord.TextChannel,
@@ -708,8 +1095,12 @@ class DiscordPurchaseBot(discord.Client):
         selected_script_key: object = UNSET,
         payment_platform_key: object = UNSET,
         payment_note_code: object = UNSET,
+        auto_close_at_utc: object = UNSET,
         stage: str | None = None,
     ) -> TicketRecord:
+        if stage is not None and stage != TICKET_STAGE_COMPLETED:
+            self.cancel_purchase_ticket_auto_close_task(channel_id)
+
         async with self.state_lock:
             record = get_ticket_record(
                 self.state,
@@ -718,6 +1109,8 @@ class DiscordPurchaseBot(discord.Client):
             )
             if stage is not None:
                 record["stage"] = stage
+                if stage != TICKET_STAGE_COMPLETED and auto_close_at_utc is UNSET:
+                    record["auto_close_at_utc"] = None
             if selected_script_key is not UNSET:
                 record["selected_script_key"] = cast(str | None, selected_script_key)
             if payment_platform_key is not UNSET:
@@ -727,6 +1120,8 @@ class DiscordPurchaseBot(discord.Client):
                 )
             if payment_note_code is not UNSET:
                 record["payment_note_code"] = cast(str | None, payment_note_code)
+            if auto_close_at_utc is not UNSET:
+                record["auto_close_at_utc"] = cast(str | None, auto_close_at_utc)
             self.persist_state()
             return cast(TicketRecord, dict(record))
 
@@ -784,6 +1179,7 @@ class DiscordPurchaseBot(discord.Client):
         await self.ensure_ticket_panel()
         await self.ensure_support_ticket_panel()
         await self.retry_pending_purchase_logs()
+        await self.restore_purchase_ticket_auto_close_tasks()
         if self.purchase_sync_retry_task is None or self.purchase_sync_retry_task.done():
             self.purchase_sync_retry_task = asyncio.create_task(
                 self.purchase_sync_retry_loop()
@@ -1137,6 +1533,39 @@ class DiscordPurchaseBot(discord.Client):
                 return channel
         return None
 
+    async def find_existing_purchase_ticket_channel(
+        self,
+        category: discord.CategoryChannel,
+        user_id: int,
+    ) -> discord.TextChannel | None:
+        expected_topic = ticket_owner_topic(user_id)
+        for channel in category.text_channels:
+            if (
+                channel.topic != expected_topic
+                and self.infer_ticket_owner_id_from_overwrites(channel) != user_id
+            ):
+                continue
+
+            ticket_record = await self.get_existing_ticket_record(channel.id)
+            if ticket_record is None:
+                return channel
+
+            ticket_stage = cast(str | None, ticket_record.get("stage"))
+            if ticket_stage == TICKET_STAGE_COMPLETED:
+                auto_close_at_utc = cast(
+                    str | None,
+                    ticket_record.get("auto_close_at_utc"),
+                )
+                await self.schedule_purchase_ticket_auto_close(
+                    channel,
+                    auto_close_at_utc=auto_close_at_utc,
+                )
+                continue
+
+            return channel
+
+        return None
+
     def get_ticket_support_roles(self, guild: discord.Guild) -> list[discord.Role]:
         support_roles: list[discord.Role] = []
         for role in guild.roles:
@@ -1390,7 +1819,10 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         async with self.ticket_creation_lock:
-            existing_channel = self.find_existing_ticket_channel(category, member.id)
+            existing_channel = await self.find_existing_purchase_ticket_channel(
+                category,
+                member.id,
+            )
             if existing_channel is not None:
                 await self.audit_purchase_event(
                     "ticket_open_existing",
@@ -2401,16 +2833,24 @@ class DiscordPurchaseBot(discord.Client):
                     await channel.send(
                         (
                             f"Payment confirmed for {selected_product.label}. "
-                            f"Here is your `{selected_product.file_path.name}` file."
+                            f"Here is your `{selected_product.file_path.name}` file.\n\n"
+                            f"This purchase ticket will close automatically in {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes. "
+                            "If you need another script after that, open a new ticket from the panel."
                         ),
                         file=build_script_delivery_file(selected_product),
                         allowed_mentions=self.response_allowed_mentions,
                     )
+                    auto_close_at_utc = self.build_purchase_ticket_auto_close_deadline()
                     await self.update_ticket_record(
                         channel.id,
                         stage=TICKET_STAGE_COMPLETED,
+                        auto_close_at_utc=auto_close_at_utc,
                     )
                     completed_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+                    await self.schedule_purchase_ticket_auto_close(
+                        channel,
+                        auto_close_at_utc=auto_close_at_utc,
+                    )
                     await self.audit_purchase_event(
                         "file_delivery_succeeded",
                         event_category="delivery",
@@ -3201,6 +3641,11 @@ class DiscordPurchaseBot(discord.Client):
                     "Admin bypass for testing: sending "
                     f"`{product.file_path.name}` for {product.label}. "
                     "This was processed via admin bypass."
+                    + (
+                        f"\n\nThis completed purchase ticket will close automatically in {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes."
+                        if mark_completed
+                        else ""
+                    )
                 ),
                 file=build_script_delivery_file(product),
                 allowed_mentions=self.response_allowed_mentions,
@@ -3271,13 +3716,19 @@ class DiscordPurchaseBot(discord.Client):
 
         updated_ticket_record = ticket_record
         if mark_completed:
+            auto_close_at_utc = self.build_purchase_ticket_auto_close_deadline()
             await self.update_ticket_record(
                 channel.id,
                 owner_id=ticket_owner_id,
                 selected_script_key=product.key,
                 stage=TICKET_STAGE_COMPLETED,
+                auto_close_at_utc=auto_close_at_utc,
             )
             updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            await self.schedule_purchase_ticket_auto_close(
+                channel,
+                auto_close_at_utc=auto_close_at_utc,
+            )
 
         await self.audit_purchase_event(
             "file_delivery_succeeded",
@@ -3366,7 +3817,7 @@ class DiscordPurchaseBot(discord.Client):
             await self.send_response(message, self.build_admin_command_panel_message())
             return True
 
-        if lower_command == "!admin catalog":
+        if lower_command in ADMIN_CATALOG_COMMAND_ALIASES:
             await self.audit_admin_event(
                 "admin_catalog_shown",
                 status="success",
@@ -3380,7 +3831,7 @@ class DiscordPurchaseBot(discord.Client):
             )
             return True
 
-        if lower_command == "!admin status":
+        if lower_command in ADMIN_STATUS_COMMAND_ALIASES:
             context = await self.get_admin_purchase_ticket_context(message)
             if context is None:
                 return True
@@ -3423,8 +3874,30 @@ class DiscordPurchaseBot(discord.Client):
             )
             return True
 
-        if lower_command.startswith("!admin set-script "):
-            selection = raw_command[len("!admin set-script ") :].strip()
+        if lower_command in ADMIN_VERSION_COMMAND_ALIASES:
+            version_message = self.build_admin_version_message()
+            await self.audit_admin_event(
+                "admin_version_shown",
+                status="success",
+                message=message,
+                channel=channel,
+                details={"version_message": version_message},
+            )
+            await self.send_response(message, version_message)
+            return True
+
+        selection = self.admin_command_argument(
+            raw_command,
+            lower_command,
+            ADMIN_SET_SCRIPT_COMMAND_PREFIXES,
+        )
+        if selection is not None:
+            if not selection:
+                await self.send_response(
+                    message,
+                    "Usage: `!admin script <name|number|filename|alias>`",
+                )
+                return True
             context = await self.get_admin_purchase_ticket_context(message)
             if context is None:
                 return True
@@ -3512,8 +3985,19 @@ class DiscordPurchaseBot(discord.Client):
             )
             return True
 
-        if lower_command.startswith("!admin set-stage "):
-            raw_stage = raw_command[len("!admin set-stage ") :].strip()
+        raw_stage = self.admin_command_argument(
+            raw_command,
+            lower_command,
+            ADMIN_SET_STAGE_COMMAND_PREFIXES,
+        )
+        if raw_stage is not None:
+            if not raw_stage:
+                await self.send_response(
+                    message,
+                    "Usage: `!admin stage <stage>`\n"
+                    f"Valid stages: {', '.join(sorted(VALID_TICKET_STAGES))}",
+                )
+                return True
             context = await self.get_admin_purchase_ticket_context(message)
             if context is None:
                 return True
@@ -3550,8 +4034,22 @@ class DiscordPurchaseBot(discord.Client):
                 channel.id,
                 owner_id=owner_id,
                 stage=resolved_stage,
+                auto_close_at_utc=(
+                    self.build_purchase_ticket_auto_close_deadline()
+                    if resolved_stage == TICKET_STAGE_COMPLETED
+                    else None
+                ),
             )
             updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            if resolved_stage == TICKET_STAGE_COMPLETED:
+                auto_close_at_utc = cast(
+                    str | None,
+                    updated_ticket_record.get("auto_close_at_utc"),
+                )
+                await self.schedule_purchase_ticket_auto_close(
+                    channel,
+                    auto_close_at_utc=auto_close_at_utc,
+                )
             await self.audit_admin_event(
                 "admin_stage_set",
                 status="success",
@@ -3588,7 +4086,7 @@ class DiscordPurchaseBot(discord.Client):
             )
             return True
 
-        if lower_command == "!admin reset-ticket":
+        if lower_command in ADMIN_RESET_COMMAND_ALIASES:
             context = await self.get_admin_purchase_ticket_context(message)
             if context is None:
                 return True
@@ -3641,14 +4139,17 @@ class DiscordPurchaseBot(discord.Client):
             )
             return True
 
-        for command_prefix, mark_completed in (
-            ("!admin deliver-file", False),
-            ("!admin bypass-email", True),
+        for command_prefixes, canonical_command, mark_completed in (
+            (ADMIN_DELIVER_COMMAND_PREFIXES, "!admin deliver", False),
+            (ADMIN_BYPASS_COMMAND_PREFIXES, "!admin bypass", True),
         ):
-            if not lower_command.startswith(command_prefix):
+            selection = self.admin_command_argument(
+                raw_command,
+                lower_command,
+                command_prefixes,
+            )
+            if selection is None:
                 continue
-
-            selection = raw_command[len(command_prefix) :].strip()
             context = await self.get_admin_purchase_ticket_context(message)
             if context is None:
                 return True
@@ -3756,7 +4257,7 @@ class DiscordPurchaseBot(discord.Client):
                 payment_note_code=current_payment_note_code,
                 previous_ticket_stage=ticket_stage,
                 mark_completed=mark_completed,
-                admin_action=command_prefix,
+                admin_action=canonical_command,
             )
             if delivered_ok:
                 success_text = (
@@ -3777,7 +4278,7 @@ class DiscordPurchaseBot(discord.Client):
         await self.send_response(
             message,
             "Unknown admin command.\n"
-            f"Use `{ADMIN_COMMAND_LIST}` to view the admin test commands.",
+            f"Use `{ADMIN_COMMAND_LIST}` to view the admin command menu.",
         )
         return True
 
@@ -3852,6 +4353,172 @@ class DiscordPurchaseBot(discord.Client):
                 channel.id,
                 owner_id=message.author.id,
             )
+
+        if message_requests_ticket_close(message.content):
+            if ticket_stage == TICKET_STAGE_PAYMENT_PENDING:
+                await self.audit_purchase_event(
+                    "purchase_ticket_close_rejected",
+                    event_category="ticket",
+                    status="failure",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    product=current_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason="purchase ticket close requested while payment check was running",
+                )
+                await self.send_response(
+                    message,
+                    "A payment check is already running for this ticket, so it can't be closed right now. Please wait for that check to finish.",
+                )
+                return
+
+            await self.audit_purchase_event(
+                "purchase_ticket_close_requested",
+                event_category="ticket",
+                status="success",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+            )
+            closed_ok = await self.close_purchase_ticket_channel(
+                channel,
+                delete_reason=(
+                    f"Purchase ticket closed by {message.author} ({message.author.id})"
+                ),
+                closing_message=(
+                    "Closing this purchase ticket now. "
+                    "You can open a new one from the panel whenever you're ready."
+                ),
+                grace_period_seconds=3,
+            )
+            await self.audit_purchase_event(
+                "purchase_ticket_closed",
+                event_category="ticket",
+                status="success" if closed_ok else "failure",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=ticket_record,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+                failure_reason="" if closed_ok else "purchase ticket close failed",
+            )
+            if not closed_ok:
+                await self.send_response(
+                    message,
+                    "I couldn't close this purchase ticket right now. Please try again or contact support.",
+                )
+            return
+
+        if message_requests_script_change(message.content):
+            if ticket_stage == TICKET_STAGE_PAYMENT_PENDING:
+                await self.audit_purchase_event(
+                    "script_change_rejected",
+                    event_category="selection",
+                    status="failure",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    product=current_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason="script change requested while payment check was running",
+                )
+                await self.send_response(
+                    message,
+                    "A payment check is already running for this ticket, so the script can't be changed right now. Please wait for that check to finish.",
+                )
+                return
+
+            if ticket_stage == TICKET_STAGE_COMPLETED:
+                await self.audit_purchase_event(
+                    "script_change_rejected",
+                    event_category="selection",
+                    status="ignored",
+                    trigger="user_message",
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    product=current_product,
+                    payment_note_code=current_payment_note_code,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalized_input,
+                    failure_reason="script change requested after ticket was completed",
+                )
+                await self.send_response(
+                    message,
+                    (
+                        "This purchase ticket is already completed. "
+                        f"It will close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery, or you can type `close ticket` now and open a new one."
+                    ),
+                )
+                return
+
+            previous_ticket_stage = ticket_stage
+            await self.update_ticket_record(
+                channel.id,
+                owner_id=message.author.id,
+                selected_script_key=None,
+                payment_platform_key=None,
+                payment_note_code=None,
+                stage=TICKET_STAGE_AWAITING_SELECTION,
+            )
+            updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            await self.audit_purchase_event(
+                "script_change_requested",
+                event_category="selection",
+                status="success",
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+                previous_ticket_stage=previous_ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+            )
+            await self.audit_stage_transition(
+                trigger="user_message",
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                previous_ticket_stage=previous_ticket_stage,
+                next_ticket_stage=TICKET_STAGE_AWAITING_SELECTION,
+                raw_user_input=message.content,
+                normalized_user_input=normalized_input,
+            )
+            await self.send_response(
+                message,
+                build_ticket_change_script_message(),
+            )
+            return
 
         if ticket_stage == TICKET_STAGE_AWAITING_CONFIRMATION:
             if message_is_selection_confirmation(message.content):
@@ -4109,7 +4776,11 @@ class DiscordPurchaseBot(discord.Client):
                 )
                 await self.send_response(
                     message,
-                    f"Payment has already been confirmed for {current_product.label} in this ticket.",
+                    (
+                        f"Payment has already been confirmed for {current_product.label} in this ticket. "
+                        f"This purchase ticket will close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery. "
+                        "You can also type `close ticket` now and open a new one."
+                    ),
                 )
                 return
 
@@ -4307,6 +4978,13 @@ class DiscordPurchaseBot(discord.Client):
             await asyncio.gather(*pending_tasks, return_exceptions=True)
             self.payment_check_tasks.clear()
             self.pending_payment_check_channel_ids.clear()
+
+        if self.purchase_ticket_auto_close_tasks:
+            pending_auto_close_tasks = tuple(self.purchase_ticket_auto_close_tasks.values())
+            for task in pending_auto_close_tasks:
+                task.cancel()
+            await asyncio.gather(*pending_auto_close_tasks, return_exceptions=True)
+            self.purchase_ticket_auto_close_tasks.clear()
 
         self.audit_logger.close()
         await super().close()

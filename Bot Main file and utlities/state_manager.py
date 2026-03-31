@@ -27,6 +27,7 @@ def fresh_ticket_record(owner_id: int | None = None) -> TicketRecord:
         "selected_script_key": None,
         "payment_platform_key": None,
         "payment_note_code": None,
+        "auto_close_at_utc": None,
         "stage": TICKET_STAGE_AWAITING_SELECTION,
     }
     if owner_id is not None:
@@ -69,6 +70,7 @@ def _coerce_ticket_record(value: object) -> TicketRecord:
     selected_script_key_value = value.get("selected_script_key")
     payment_platform_key_value = value.get("payment_platform_key")
     payment_note_code_value = value.get("payment_note_code")
+    auto_close_at_utc_value = value.get("auto_close_at_utc")
     stage_value = value.get("stage")
 
     record = fresh_ticket_record()
@@ -85,6 +87,15 @@ def _coerce_ticket_record(value: object) -> TicketRecord:
         normalized_note_code = payment_note_code_value.strip().upper()
         if normalized_note_code:
             record["payment_note_code"] = normalized_note_code
+    if isinstance(auto_close_at_utc_value, str):
+        normalized_auto_close_at_utc = auto_close_at_utc_value.strip()
+        if normalized_auto_close_at_utc:
+            try:
+                datetime.fromisoformat(normalized_auto_close_at_utc)
+            except ValueError:
+                pass
+            else:
+                record["auto_close_at_utc"] = normalized_auto_close_at_utc
     if isinstance(stage_value, str) and stage_value in VALID_TICKET_STAGES:
         record["stage"] = stage_value
     return record
