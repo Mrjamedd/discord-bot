@@ -18,6 +18,7 @@ class TicketStateManagerTests(unittest.TestCase):
 
         self.assertEqual(123, record["owner_id"])
         self.assertIsNone(record["auto_close_at_utc"])
+        self.assertIsNone(record["ticket_price_override"])
 
     def test_coerce_ticket_record_keeps_valid_auto_close_deadline(self) -> None:
         record = _coerce_ticket_record(
@@ -40,6 +41,24 @@ class TicketStateManagerTests(unittest.TestCase):
         )
 
         self.assertIsNone(record["auto_close_at_utc"])
+
+    def test_coerce_ticket_record_keeps_valid_ticket_price_override(self) -> None:
+        record = _coerce_ticket_record(
+            {
+                "ticket_price_override": "$15.50",
+            }
+        )
+
+        self.assertEqual("15.50", record["ticket_price_override"])
+
+    def test_coerce_ticket_record_discards_invalid_ticket_price_override(self) -> None:
+        record = _coerce_ticket_record(
+            {
+                "ticket_price_override": "-4",
+            }
+        )
+
+        self.assertIsNone(record["ticket_price_override"])
 
 
 if __name__ == "__main__":

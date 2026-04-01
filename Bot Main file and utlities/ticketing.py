@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import re
 import secrets
 
@@ -56,6 +57,7 @@ VALID_TICKET_STAGES: set[str] = {
     TICKET_STAGE_COMPLETED,
 }
 UNSET = object()
+PRICE_QUANTUM = Decimal("0.01")
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,62 @@ def build_catalog_line(
     return (
         f"{prefix}{product.label} - ${product.price} "
         f"(delivery file: {product.file_path.name})"
+    )
+
+
+def normalize_ticket_price_text(value: Decimal | int | str) -> str | None:
+    decimal_value: Decimal
+    if isinstance(value, Decimal):
+        decimal_value = value
+    elif isinstance(value, int):
+        decimal_value = Decimal(value)
+    elif isinstance(value, str):
+        stripped_value = value.strip()
+        if stripped_value.startswith("$"):
+            stripped_value = stripped_value[1:].strip()
+        if not stripped_value:
+            return None
+        try:
+            decimal_value = Decimal(stripped_value)
+        except (InvalidOperation, ValueError):
+            return None
+    else:
+        return None
+
+    if not decimal_value.is_finite() or decimal_value <= 0:
+        return None
+    return format(decimal_value.quantize(PRICE_QUANTUM), "f")
+
+
+def resolve_ticket_price_text(
+    product: ScriptProduct | None,
+    *,
+    ticket_price_override: str | None = None,
+) -> str | None:
+    if ticket_price_override is not None:
+        normalized_override = normalize_ticket_price_text(ticket_price_override)
+        if normalized_override is not None:
+            return normalized_override
+    if product is None:
+        return None
+    return normalize_ticket_price_text(product.price)
+
+
+def build_selected_product_price_text(
+    product: ScriptProduct,
+    *,
+    ticket_price_override: str | None = None,
+) -> str:
+    effective_price = resolve_ticket_price_text(
+        product,
+        ticket_price_override=ticket_price_override,
+    ) or "0.00"
+    standard_price = normalize_ticket_price_text(product.price) or "0.00"
+    if effective_price == standard_price:
+        return f"{product.label} - ${effective_price}"
+    return (
+        f"{product.label} - ${effective_price} "
+        f"(admin-set ticket price; standard ${standard_price})"
     )
 
 
@@ -150,15 +208,24 @@ def build_ticket_change_script_message() -> str:
     )
 
 
-def build_script_confirmation_message(product: ScriptProduct) -> str:
+def build_script_confirmation_message(
+    product: ScriptProduct,
+    *,
+    ticket_price_override: str | None = None,
+) -> str:
     return (
         "Confirming this is the script you want:\n"
-        f"{product.label} - ${product.price} - delivery file: {product.file_path.name}\n"
+        f"{build_selected_product_price_text(product, ticket_price_override=ticket_price_override)} "
+        f"- delivery file: {product.file_path.name}\n"
         f"Type {CONFIRM_SELECTION_RESPONSE} to confirm and proceed."
     )
 
 
-def build_payment_platform_prompt_message(product: ScriptProduct) -> str:
+def build_payment_platform_prompt_message(
+    product: ScriptProduct,
+    *,
+    ticket_price_override: str | None = None,
+) -> str:
     available_platforms = ", ".join(
         platform.label for platform in PAYMENT_PLATFORMS
     )
@@ -168,7 +235,8 @@ def build_payment_platform_prompt_message(product: ScriptProduct) -> str:
         else f"Available right now: {available_platforms}."
     )
     return (
-        f"Your script is confirmed as {product.label} - ${product.price}.\n"
+        "Your script is confirmed as "
+        f"{build_selected_product_price_text(product, ticket_price_override=ticket_price_override)}.\n"
         "Which payment platform would you like to use?\n"
         f"{availability_text}\n"
         "Select a payment platform below to continue."
@@ -179,12 +247,26 @@ def build_payment_instruction_message(
     product: ScriptProduct,
     platform: PaymentPlatform,
     payment_note_code: str,
+    *,
+    ticket_price_override: str | None = None,
 ) -> str:
+    effective_price = resolve_ticket_price_text(
+        product,
+        ticket_price_override=ticket_price_override,
+    ) or "0.00"
+    standard_price = normalize_ticket_price_text(product.price) or "0.00"
+    payment_amount_instruction = (
+        f"For this ticket, send ${effective_price} for {product.label}."
+        if effective_price == standard_price
+        else (
+            f"For this ticket, send the admin-set price of ${effective_price} for "
+            f"{product.label} (standard price ${standard_price})."
+        )
+    )
     return (
         f"{platform.label} selected as your payment method.\n"
         f"Send the amount for the script to the {platform.destination_label} "
-        f"{platform.destination_value}. For this ticket, send ${product.price} for "
-        f"{product.label}.\n\n"
+        f"{platform.destination_value}. {payment_amount_instruction}\n\n"
         "Important: put this exact code in the payment note/message.\n"
         f"`{payment_note_code}`\n"
         "Use the code exactly as shown. If the receipt email does not contain this code, "

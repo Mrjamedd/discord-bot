@@ -8,6 +8,7 @@ from typing import TypedDict
 class TicketRecord(TypedDict, total=False):
     owner_id: int
     selected_script_key: str | None
+    ticket_price_override: str | None
     payment_platform_key: str | None
     payment_note_code: str | None
     auto_close_at_utc: str | None
@@ -59,7 +60,7 @@ PurchaseRecord = TypedDict(
         "Item Purchased": str,
         "Item Key": str,
         "Delivered File": str,
-        "Price Paid": int,
+        "Price Paid": str,
         "Channel ID": int,
         "Guild ID": int,
         "Purchase Event ID": str,

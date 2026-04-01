@@ -13,7 +13,10 @@ if str(MODULE_DIR) not in sys.path:
 from models import ScriptProduct
 from purchase_audit_logger import PURCHASE_AUDIT_COLUMNS, _build_purchase_audit_row
 from ticketing import (
+    PAYMENT_PLATFORMS,
     PURCHASE_TICKET_AUTO_CLOSE_MINUTES,
+    build_payment_instruction_message,
+    build_script_confirmation_message,
     build_ticket_change_script_message,
     build_ticket_catalog_lines,
     build_ticket_retry_message,
@@ -86,6 +89,39 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
         )
         self.assertIn("`change script`", change_script_message)
         self.assertIn("`close ticket`", change_script_message)
+
+    def test_script_confirmation_message_can_show_ticket_price_override(self) -> None:
+        message = build_script_confirmation_message(
+            ScriptProduct(
+                key="golden-free-aim-v2",
+                label="Golden V2",
+                price=23,
+                file_path=Path("/tmp/GOLDEN_FREE_v2.gpc"),
+                aliases=(),
+            ),
+            ticket_price_override="15.00",
+        )
+
+        self.assertIn("$15.00", message)
+        self.assertIn("standard $23.00", message)
+
+    def test_payment_instruction_message_can_show_ticket_price_override(self) -> None:
+        message = build_payment_instruction_message(
+            ScriptProduct(
+                key="golden-free-aim-v2",
+                label="Golden V2",
+                price=23,
+                file_path=Path("/tmp/GOLDEN_FREE_v2.gpc"),
+                aliases=(),
+            ),
+            PAYMENT_PLATFORMS[0],
+            "ZEN-AB12CD",
+            ticket_price_override="12.50",
+        )
+
+        self.assertIn("$12.50", message)
+        self.assertIn("standard price $23.00", message)
+        self.assertIn("ZEN-AB12CD", message)
 
     def test_ticket_management_commands_are_normalized(self) -> None:
         self.assertTrue(message_requests_script_change("Change Script"))

@@ -82,7 +82,9 @@ from ticketing import (
     message_requests_script_change,
     message_requests_ticket_close,
     message_is_selection_confirmation,
+    normalize_ticket_price_text,
     resolve_script_product_selection,
+    resolve_ticket_price_text,
     ticket_owner_id_from_topic,
     ticket_owner_topic,
 )
@@ -128,6 +130,11 @@ ADMIN_SET_STAGE_COMMAND_PREFIXES = (
     "!admin set-stage",
     "!admin set stage",
     "!admin stage",
+)
+ADMIN_SET_PRICE_COMMAND_PREFIXES = (
+    "!admin set-price",
+    "!admin set price",
+    "!admin price",
 )
 ADMIN_RESET_COMMAND_ALIASES = frozenset(
     {"!admin reset-ticket", "!admin reset", "!admin reset ticket", "!admin start over"}
@@ -212,11 +219,13 @@ class DiscordPurchaseBot(discord.Client):
             "- `!admin menu`\n"
             "- `!admin commands`\n\n"
             "Read-only:\n"
-            "- `!admin status`: show the current ticket owner, stage, selected script, payment platform, and note code\n"
+            "- `!admin status`: show the current ticket owner, stage, selected script, payment platform, note code, and effective ticket price\n"
             "- `!admin catalog`: show the full asset-backed script catalog\n"
             "- `!admin version`: show the deployed bot version, tag, and commit\n\n"
             "Control:\n"
             "- `!admin script <name|number|filename|alias>`: set the selected script and move the ticket to awaiting confirmation\n"
+            "- `!admin price <amount>`: set a ticket-specific price override (for example `15`, `15.00`, or `$15.00`)\n"
+            "- `!admin price default`: clear the ticket-specific price override and restore the standard script price\n"
             f"- `!admin stage <stage>`: force the ticket stage. Valid stages: {available_stages}\n"
             "- `!admin reset`: clear the script/payment state and return the ticket to selection\n"
             "- `!admin deliver [name|number|filename|alias]`: send a file immediately without changing the ticket to completed\n"
@@ -253,6 +262,76 @@ class DiscordPurchaseBot(discord.Client):
 
         output = completed.stdout.strip()
         return output or None
+
+    def get_ticket_price_override(
+        self,
+        ticket_record: TicketRecord | None,
+    ) -> str | None:
+        if ticket_record is None:
+            return None
+        raw_override = ticket_record.get("ticket_price_override")
+        if not isinstance(raw_override, str):
+            return None
+        return normalize_ticket_price_text(raw_override)
+
+    def get_effective_ticket_price_text(
+        self,
+        product: ScriptProduct | None,
+        *,
+        ticket_record: TicketRecord | None = None,
+    ) -> str | None:
+        return resolve_ticket_price_text(
+            product,
+            ticket_price_override=self.get_ticket_price_override(ticket_record),
+        )
+
+    def get_effective_ticket_price_decimal(
+        self,
+        product: ScriptProduct | None,
+        *,
+        ticket_record: TicketRecord | None = None,
+    ) -> Decimal | None:
+        price_text = self.get_effective_ticket_price_text(
+            product,
+            ticket_record=ticket_record,
+        )
+        if price_text is None:
+            return None
+        return Decimal(price_text)
+
+    def build_ticket_price_status_lines(
+        self,
+        product: ScriptProduct | None,
+        *,
+        ticket_record: TicketRecord | None = None,
+    ) -> tuple[str, ...]:
+        ticket_price_override = self.get_ticket_price_override(ticket_record)
+        effective_price = self.get_effective_ticket_price_text(
+            product,
+            ticket_record=ticket_record,
+        )
+        if product is None:
+            return (
+                f"Ticket price override: ${ticket_price_override}"
+                if ticket_price_override is not None
+                else "Ticket price override: none",
+                (
+                    f"Effective price: ${effective_price} once a script is selected"
+                    if effective_price is not None
+                    else "Effective price: uses the selected script's standard price",
+                ),
+            )
+
+        standard_price = resolve_ticket_price_text(product) or "0.00"
+        return (
+            f"Standard price: ${standard_price}",
+            (
+                f"Ticket price override: ${ticket_price_override}"
+                if ticket_price_override is not None
+                else "Ticket price override: none",
+            ),
+            f"Effective price: ${effective_price or standard_price}",
+        )
 
     def build_admin_version_message(self) -> str:
         description = self.run_git_version_command("describe", "--tags", "--dirty", "--always")
@@ -466,6 +545,9 @@ class DiscordPurchaseBot(discord.Client):
             if button_custom_id is None and interaction is not None:
                 button_custom_id = self.interaction_custom_id(interaction)
             details_payload = dict(details or {})
+            ticket_price_override = self.get_ticket_price_override(ticket_record)
+            if ticket_price_override is not None:
+                details_payload.setdefault("ticket_price_override", ticket_price_override)
             if trigger == ADMIN_COMMAND_TRIGGER:
                 details_payload.setdefault("admin_bypass", True)
                 details_payload.setdefault("processed_via", "admin_bypass")
@@ -504,7 +586,10 @@ class DiscordPurchaseBot(discord.Client):
                 "selected_product_filename": (
                     None if product is None else product.file_path.name
                 ),
-                "selected_price": None if product is None else product.price,
+                "selected_price": self.get_effective_ticket_price_text(
+                    product,
+                    ticket_record=ticket_record,
+                ),
                 "payment_platform_key": None if platform is None else platform.key,
                 "payment_platform_label": None if platform is None else platform.label,
                 "payment_note_code": payment_note_code or "",
@@ -1093,6 +1178,7 @@ class DiscordPurchaseBot(discord.Client):
         *,
         owner_id: int | None = None,
         selected_script_key: object = UNSET,
+        ticket_price_override: object = UNSET,
         payment_platform_key: object = UNSET,
         payment_note_code: object = UNSET,
         auto_close_at_utc: object = UNSET,
@@ -1113,6 +1199,11 @@ class DiscordPurchaseBot(discord.Client):
                     record["auto_close_at_utc"] = None
             if selected_script_key is not UNSET:
                 record["selected_script_key"] = cast(str | None, selected_script_key)
+            if ticket_price_override is not UNSET:
+                record["ticket_price_override"] = cast(
+                    str | None,
+                    ticket_price_override,
+                )
             if payment_platform_key is not UNSET:
                 record["payment_platform_key"] = cast(
                     str | None,
@@ -2503,6 +2594,7 @@ class DiscordPurchaseBot(discord.Client):
                     selected_product,
                     selected_platform,
                     payment_note_code,
+                    ticket_price_override=self.get_ticket_price_override(ticket_record),
                 ),
                 view=self.build_payment_confirmation_view(),
                 allowed_mentions=self.response_allowed_mentions,
@@ -2646,11 +2738,10 @@ class DiscordPurchaseBot(discord.Client):
 
         try:
             await asyncio.sleep(PAYMENT_CHECK_DELAY_SECONDS)
-            expected_amount = (
-                Decimal(str(selected_product.price))
-                if selected_product is not None
-                else PAYMENT_PARSER_EXPECTED_AMOUNT
-            )
+            expected_amount = self.get_effective_ticket_price_decimal(
+                selected_product,
+                ticket_record=ticket_record,
+            ) or PAYMENT_PARSER_EXPECTED_AMOUNT
             if not payment_note_code:
                 parser_result = {
                     "matched": False,
@@ -2896,6 +2987,7 @@ class DiscordPurchaseBot(discord.Client):
                         channel,
                         user_id,
                         selected_product,
+                        ticket_record=completed_ticket_record,
                     )
                     return
                 except FileNotFoundError as exc:
@@ -3268,7 +3360,10 @@ class DiscordPurchaseBot(discord.Client):
         )
         try:
             await message.reply(
-                build_script_confirmation_message(product),
+                build_script_confirmation_message(
+                    product,
+                    ticket_price_override=self.get_ticket_price_override(ticket_record),
+                ),
                 mention_author=False,
                 allowed_mentions=self.response_allowed_mentions,
             )
@@ -3335,7 +3430,10 @@ class DiscordPurchaseBot(discord.Client):
 
         try:
             await message.reply(
-                build_payment_platform_prompt_message(selected_product),
+                build_payment_platform_prompt_message(
+                    selected_product,
+                    ticket_price_override=self.get_ticket_price_override(ticket_record),
+                ),
                 mention_author=False,
                 view=self.build_payment_platform_selection_view(),
                 allowed_mentions=self.response_allowed_mentions,
@@ -3381,6 +3479,7 @@ class DiscordPurchaseBot(discord.Client):
         user_id: int,
         product: ScriptProduct,
         *,
+        price_paid: str,
         purchase_timestamp: str,
     ) -> PurchaseRecord:
         username, display_name = await self.resolve_user_identity(
@@ -3398,7 +3497,7 @@ class DiscordPurchaseBot(discord.Client):
             "Item Purchased": product.label,
             "Item Key": product.key,
             "Delivered File": product.file_path.name,
-            "Price Paid": product.price,
+            "Price Paid": price_paid,
             "Channel ID": channel.id,
             "Guild ID": guild_id,
             "Purchase Event ID": uuid4().hex,
@@ -3409,12 +3508,19 @@ class DiscordPurchaseBot(discord.Client):
         channel: discord.TextChannel,
         user_id: int,
         product: ScriptProduct,
+        *,
+        ticket_record: TicketRecord | None = None,
     ) -> None:
         purchase_timestamp = utc_timestamp()
+        price_paid = self.get_effective_ticket_price_text(
+            product,
+            ticket_record=ticket_record,
+        ) or (resolve_ticket_price_text(product) or "0.00")
         purchase_record = await self.build_purchase_record(
             channel,
             user_id,
             product,
+            price_paid=price_paid,
             purchase_timestamp=purchase_timestamp,
         )
         async with self.purchase_sync_lock:
@@ -3860,6 +3966,10 @@ class DiscordPurchaseBot(discord.Client):
                 owner_id,
                 guild=channel.guild,
             )
+            price_status_lines = self.build_ticket_price_status_lines(
+                current_product,
+                ticket_record=ticket_record,
+            )
             await self.send_response(
                 message,
                 (
@@ -3869,7 +3979,8 @@ class DiscordPurchaseBot(discord.Client):
                     f"Selected script: {current_product.label if current_product is not None else 'none'}\n"
                     f"Selected file: {current_product.file_path.name if current_product is not None else 'none'}\n"
                     f"Payment platform: {current_platform.label if current_platform is not None else 'none'}\n"
-                    f"Payment note code: {current_payment_note_code or 'none'}"
+                    f"Payment note code: {current_payment_note_code or 'none'}\n"
+                    + "\n".join(price_status_lines)
                 ),
             )
             return True
@@ -3981,8 +4092,206 @@ class DiscordPurchaseBot(discord.Client):
             await self.send_response(
                 message,
                 "Admin bypass selected this script for testing:\n"
-                f"{build_script_confirmation_message(selected_product)}",
+                + build_script_confirmation_message(
+                    selected_product,
+                    ticket_price_override=self.get_ticket_price_override(
+                        updated_ticket_record
+                    ),
+                ),
             )
+            return True
+
+        raw_price_input = self.admin_command_argument(
+            raw_command,
+            lower_command,
+            ADMIN_SET_PRICE_COMMAND_PREFIXES,
+        )
+        if raw_price_input is not None:
+            if not raw_price_input:
+                await self.send_response(
+                    message,
+                    "Usage: `!admin price <amount>` or `!admin price default`",
+                )
+                return True
+            context = await self.get_admin_purchase_ticket_context(message)
+            if context is None:
+                return True
+            (
+                channel,
+                owner_id,
+                ticket_record,
+                ticket_stage,
+                current_product,
+                current_platform,
+                current_payment_note_code,
+            ) = context
+
+            if ticket_stage == TICKET_STAGE_PAYMENT_PENDING:
+                await self.audit_admin_event(
+                    "admin_price_set_failed",
+                    status="failure",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    product=current_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    failure_reason="price override change requested while payment check was running",
+                )
+                await self.send_response(
+                    message,
+                    "A payment check is already running for this ticket, so the price can't be changed right now.",
+                )
+                return True
+
+            if ticket_stage == TICKET_STAGE_COMPLETED:
+                await self.audit_admin_event(
+                    "admin_price_set_failed",
+                    status="failure",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    product=current_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    failure_reason="price override change requested after ticket completion",
+                )
+                await self.send_response(
+                    message,
+                    "This ticket is already completed, so the price override can't be changed now.",
+                )
+                return True
+
+            normalized_keyword = normalize_text(raw_price_input)
+            clear_price_override = normalized_keyword in {
+                "default",
+                "standard",
+                "full",
+                "full price",
+                "clear",
+                "reset",
+            }
+
+            ticket_price_override: str | None
+            admin_event_type: str
+            purchase_event_type: str
+            if clear_price_override:
+                ticket_price_override = None
+                admin_event_type = "admin_price_override_cleared"
+                purchase_event_type = "ticket_price_override_cleared"
+            else:
+                ticket_price_override = normalize_ticket_price_text(raw_price_input)
+                if ticket_price_override is None:
+                    await self.audit_admin_event(
+                        "admin_price_set_failed",
+                        status="failure",
+                        message=message,
+                        channel=channel,
+                        ticket_owner_id=owner_id,
+                        ticket_record=ticket_record,
+                        ticket_stage=ticket_stage,
+                        product=current_product,
+                        platform=current_platform,
+                        payment_note_code=current_payment_note_code,
+                        failure_reason="invalid price override",
+                        details={"requested_price": raw_price_input},
+                    )
+                    await self.send_response(
+                        message,
+                        "Invalid price. Use a positive amount like `15`, `15.00`, or `$15.00`, or use `!admin price default`.",
+                    )
+                    return True
+                admin_event_type = "admin_price_override_set"
+                purchase_event_type = "ticket_price_override_set"
+
+            await self.update_ticket_record(
+                channel.id,
+                owner_id=owner_id,
+                ticket_price_override=ticket_price_override,
+            )
+            updated_ticket_record = await self.get_ticket_record_snapshot(channel.id)
+            effective_price = self.get_effective_ticket_price_text(
+                current_product,
+                ticket_record=updated_ticket_record,
+            )
+            standard_price = (
+                resolve_ticket_price_text(current_product)
+                if current_product is not None
+                else None
+            )
+
+            await self.audit_admin_event(
+                admin_event_type,
+                status="success",
+                message=message,
+                channel=channel,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                ticket_stage=ticket_stage,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                details={
+                    "requested_price": raw_price_input,
+                    "ticket_price_override": ticket_price_override,
+                    "effective_price": effective_price,
+                    "standard_price": standard_price,
+                },
+            )
+            await self.audit_purchase_event(
+                purchase_event_type,
+                event_category="payment",
+                status="success",
+                trigger=ADMIN_COMMAND_TRIGGER,
+                channel=channel,
+                message=message,
+                ticket_owner_id=owner_id,
+                ticket_record=updated_ticket_record,
+                ticket_stage=ticket_stage,
+                product=current_product,
+                platform=current_platform,
+                payment_note_code=current_payment_note_code,
+                raw_user_input=message.content,
+                normalized_user_input=normalize_text(message.content),
+                details={
+                    "requested_price": raw_price_input,
+                    "ticket_price_override": ticket_price_override,
+                    "effective_price": effective_price,
+                    "standard_price": standard_price,
+                },
+            )
+
+            response_lines = [
+                (
+                    "Admin bypass cleared the ticket-specific price override."
+                    if clear_price_override
+                    else f"Admin bypass set the ticket-specific price to ${ticket_price_override}."
+                )
+            ]
+            if current_product is not None:
+                response_lines.append(f"Selected script: {current_product.label}")
+                if standard_price is not None:
+                    response_lines.append(f"Standard price: ${standard_price}")
+                if effective_price is not None:
+                    response_lines.append(f"Effective price: ${effective_price}")
+            else:
+                response_lines.append(
+                    "No script is selected yet, so this price will apply once the customer chooses one."
+                )
+            if (
+                current_platform is not None
+                and current_payment_note_code
+                and effective_price is not None
+                and ticket_stage == TICKET_STAGE_AWAITING_PAYMENT
+            ):
+                response_lines.append(
+                    f"Current payment instructions: {current_platform.label}, pay ${effective_price}, note code `{current_payment_note_code}`."
+                )
+            await self.send_response(message, "\n".join(response_lines))
             return True
 
         raw_stage = self.admin_command_argument(
@@ -4820,16 +5129,20 @@ class DiscordPurchaseBot(discord.Client):
                 raw_user_input=message.content,
                 normalized_user_input=normalized_input,
             )
+            effective_price = self.get_effective_ticket_price_text(
+                current_product,
+                ticket_record=ticket_record,
+            ) or (resolve_ticket_price_text(current_product) or "0.00")
             await self.send_response(
                 message,
                 (
-                    f"Your script is confirmed as {current_product.label}. "
+                    f"Your script is confirmed as {current_product.label} for ${effective_price}. "
                     f"{current_platform.label} is selected. "
                     f"Use the exact payment note code `{current_payment_note_code or 'missing'}` and press Confirm Payment when you're ready."
                 )
                 if current_platform is not None
                 else (
-                    f"Your script is confirmed as {current_product.label}. "
+                    f"Your script is confirmed as {current_product.label} for ${effective_price}. "
                     "Press Confirm Payment when you're ready."
                 ),
             )

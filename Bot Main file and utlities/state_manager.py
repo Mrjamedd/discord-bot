@@ -13,6 +13,7 @@ from ticketing import (
     SCRIPT_PRODUCTS_BY_KEY,
     TICKET_STAGE_AWAITING_SELECTION,
     VALID_TICKET_STAGES,
+    normalize_ticket_price_text,
     resolve_script_product_key,
 )
 from utils import ensure_parent_directory
@@ -25,6 +26,7 @@ def fresh_payment_parser_state() -> ParserReplayState:
 def fresh_ticket_record(owner_id: int | None = None) -> TicketRecord:
     record: TicketRecord = {
         "selected_script_key": None,
+        "ticket_price_override": None,
         "payment_platform_key": None,
         "payment_note_code": None,
         "auto_close_at_utc": None,
@@ -68,6 +70,7 @@ def _coerce_ticket_record(value: object) -> TicketRecord:
 
     owner_id_value = value.get("owner_id")
     selected_script_key_value = value.get("selected_script_key")
+    ticket_price_override_value = value.get("ticket_price_override")
     payment_platform_key_value = value.get("payment_platform_key")
     payment_note_code_value = value.get("payment_note_code")
     auto_close_at_utc_value = value.get("auto_close_at_utc")
@@ -80,6 +83,12 @@ def _coerce_ticket_record(value: object) -> TicketRecord:
         resolved_script_key = resolve_script_product_key(selected_script_key_value)
         if resolved_script_key in SCRIPT_PRODUCTS_BY_KEY:
             record["selected_script_key"] = resolved_script_key
+    if isinstance(ticket_price_override_value, str):
+        normalized_price_override = normalize_ticket_price_text(
+            ticket_price_override_value
+        )
+        if normalized_price_override is not None:
+            record["ticket_price_override"] = normalized_price_override
     if isinstance(payment_platform_key_value, str):
         if payment_platform_key_value in PAYMENT_PLATFORMS_BY_KEY:
             record["payment_platform_key"] = payment_platform_key_value
