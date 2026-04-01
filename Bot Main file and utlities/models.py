@@ -47,6 +47,7 @@ class PaymentParserResult(TypedDict, total=False):
     timestamp_in_window: bool
     auth_strength: int
     sender_address_allowlisted: bool
+    expected_payment_note_found: bool
 
 
 PurchaseRecord = TypedDict(

@@ -91,9 +91,62 @@ def private_email_parser_config_error() -> str | None:
     return None
 
 
+def _normalize_payment_note(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().upper()
+
+
+def _normalize_ticket_scoped_rejection(result: Any, *, expected_payment_note: str) -> Any:
+    if not isinstance(result, dict):
+        return result
+    if result.get("matched") is True:
+        return result
+
+    normalized_expected_note = _normalize_payment_note(expected_payment_note)
+    if not normalized_expected_note:
+        return result
+
+    expected_payment_note_found = result.get("expected_payment_note_found")
+    if expected_payment_note_found is True:
+        return result
+
+    if expected_payment_note_found is not False and result.get("reason") != "payment note missing":
+        return result
+
+    normalized_result = dict(result)
+    normalized_result.update(
+        {
+            "matched": False,
+            "reason": "no candidate messages found",
+            "gmail_message_id": None,
+            "from_address": None,
+            "from_domain": None,
+            "amount": None,
+            "amount_shortfall": None,
+            "currency": None,
+            "received_timestamp_utc": None,
+            "auth_summary": "missing",
+            "forwarding_flags": [],
+            "amount_candidates": [],
+            "weak_forwarding_flags": [],
+            "timestamp_in_window": False,
+            "auth_strength": 0,
+            "sender_address_allowlisted": False,
+            "expected_payment_note": normalized_expected_note,
+            "expected_payment_note_found": False,
+        }
+    )
+    return normalized_result
+
+
 def check_payment_email(*args: object, **kwargs: object) -> Any:
     parser = _get_private_email_parser()
-    return getattr(parser, "check_payment_email")(*args, **kwargs)
+    result = getattr(parser, "check_payment_email")(*args, **kwargs)
+    return _normalize_ticket_scoped_rejection(
+        result,
+        expected_payment_note=kwargs.get("expected_payment_note", ""),
+    )
 
 
 def __getattr__(name: str) -> Any:
