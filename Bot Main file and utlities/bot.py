@@ -418,6 +418,9 @@ class DiscordPurchaseBot(discord.Client):
 
         try:
             fetched_user = await self.fetch_user(user_id)
+        except AttributeError:
+            fallback_name = f"unknown-user-{user_id}"
+            return fallback_name, fallback_name
         except discord.DiscordException:
             self.logger.exception(
                 "user_lookup_failed user_id=%s guild_id=%s timestamp=%s",
@@ -477,8 +480,13 @@ class DiscordPurchaseBot(discord.Client):
             ):
                 resolved_channel = message.channel
 
+            resolved_channel_guild = (
+                getattr(resolved_channel, "guild", None)
+                if resolved_channel is not None
+                else None
+            )
             guild = (
-                resolved_channel.guild
+                resolved_channel_guild
                 if resolved_channel is not None
                 else interaction.guild
                 if interaction is not None
@@ -566,8 +574,8 @@ class DiscordPurchaseBot(discord.Client):
                 "discord_display_name": actor_display_name,
                 "ticket_owner_id": ticket_owner_id,
                 "ticket_owner_username": ticket_owner_username,
-                "channel_id": None if resolved_channel is None else resolved_channel.id,
-                "channel_name": None if resolved_channel is None else resolved_channel.name,
+                "channel_id": None if resolved_channel is None else getattr(resolved_channel, "id", None),
+                "channel_name": None if resolved_channel is None else getattr(resolved_channel, "name", ""),
                 "guild_id": None if guild is None else guild.id,
                 "guild_name": None if guild is None else guild.name,
                 "message_id": (

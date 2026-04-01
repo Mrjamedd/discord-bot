@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+from Email_Parser import private_email_parser_config_error
 from assets import validate_script_asset_directory
 from bot import DiscordPurchaseBot
 from config import (
@@ -53,6 +54,10 @@ def _runtime_configuration_errors() -> list[str]:
     ):
         if not (os.getenv(env_name) or "").strip():
             errors.append(f"{env_name} is not set.")
+
+    parser_config_error = private_email_parser_config_error()
+    if parser_config_error is not None:
+        errors.append(parser_config_error)
 
     if not CASH_APP_CASHTAG or CASH_APP_CASHTAG == "$CHANGE_ME":
         errors.append("CASH_APP_CASHTAG must be set to the payment destination you advertise to customers.")

@@ -46,7 +46,13 @@ def _load_private_email_parser() -> ModuleType:
 
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            raise ImportError(
+                "Private email parser implementation failed to load. "
+                f"Path: {candidate_path}. Error: {exc}"
+            ) from exc
         return module
 
     searched = ", ".join(searched_paths) if searched_paths else "<none>"
@@ -57,30 +63,57 @@ def _load_private_email_parser() -> ModuleType:
     )
 
 
-_PRIVATE_EMAIL_PARSER = _load_private_email_parser()
-PAYMENT_PARSER_EXPECTED_AMOUNT = getattr(
-    _PRIVATE_EMAIL_PARSER,
-    "PAYMENT_PARSER_EXPECTED_AMOUNT",
-)
-check_payment_email = getattr(
-    _PRIVATE_EMAIL_PARSER,
-    "check_payment_email",
-)
+_PRIVATE_EMAIL_PARSER: ModuleType | None = None
+_PRIVATE_EMAIL_PARSER_LOAD_ERROR: ImportError | None = None
+
+
+def _get_private_email_parser() -> ModuleType:
+    global _PRIVATE_EMAIL_PARSER, _PRIVATE_EMAIL_PARSER_LOAD_ERROR
+
+    if _PRIVATE_EMAIL_PARSER is not None:
+        return _PRIVATE_EMAIL_PARSER
+    if _PRIVATE_EMAIL_PARSER_LOAD_ERROR is not None:
+        raise _PRIVATE_EMAIL_PARSER_LOAD_ERROR
+
+    try:
+        _PRIVATE_EMAIL_PARSER = _load_private_email_parser()
+    except ImportError as exc:
+        _PRIVATE_EMAIL_PARSER_LOAD_ERROR = exc
+        raise
+    return _PRIVATE_EMAIL_PARSER
+
+
+def private_email_parser_config_error() -> str | None:
+    try:
+        _get_private_email_parser()
+    except ImportError as exc:
+        return str(exc)
+    return None
+
+
+def check_payment_email(*args: object, **kwargs: object) -> Any:
+    parser = _get_private_email_parser()
+    return getattr(parser, "check_payment_email")(*args, **kwargs)
 
 
 def __getattr__(name: str) -> Any:
-    return getattr(_PRIVATE_EMAIL_PARSER, name)
+    if name.startswith("__"):
+        raise AttributeError(name)
+    return getattr(_get_private_email_parser(), name)
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(dir(_PRIVATE_EMAIL_PARSER)))
+    try:
+        parser_dir = set(dir(_get_private_email_parser()))
+    except ImportError:
+        parser_dir = set()
+    return sorted(set(globals()) | parser_dir)
 
 
-__all__ = getattr(
-    _PRIVATE_EMAIL_PARSER,
-    "__all__",
-    ["PAYMENT_PARSER_EXPECTED_AMOUNT", "check_payment_email"],
-)
+__all__ = [
+    "check_payment_email",
+    "private_email_parser_config_error",
+]
 
 
 class _PrivateEmailParserProxyModule(ModuleType):
@@ -90,8 +123,12 @@ class _PrivateEmailParserProxyModule(ModuleType):
             "DEFAULT_PRIVATE_EMAIL_PARSER_PATH",
             "_candidate_private_parser_paths",
             "_load_private_email_parser",
+            "_get_private_email_parser",
             "_PRIVATE_EMAIL_PARSER",
+            "_PRIVATE_EMAIL_PARSER_LOAD_ERROR",
             "_PrivateEmailParserProxyModule",
+            "private_email_parser_config_error",
+            "check_payment_email",
             "__all__",
             "__spec__",
             "__loader__",
@@ -105,14 +142,20 @@ class _PrivateEmailParserProxyModule(ModuleType):
     def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
         if name not in self._LOCAL_ONLY_NAMES:
-            setattr(_PRIVATE_EMAIL_PARSER, name, value)
+            setattr(_get_private_email_parser(), name, value)
 
     def __delattr__(self, name: str) -> None:
         had_local_attr = hasattr(self, name)
         if had_local_attr:
             super().__delattr__(name)
-        if name not in self._LOCAL_ONLY_NAMES and hasattr(_PRIVATE_EMAIL_PARSER, name):
-            delattr(_PRIVATE_EMAIL_PARSER, name)
+        if name in self._LOCAL_ONLY_NAMES:
+            return
+        try:
+            parser = _get_private_email_parser()
+        except ImportError:
+            return
+        if hasattr(parser, name):
+            delattr(parser, name)
 
 
 sys.modules[__name__].__class__ = _PrivateEmailParserProxyModule
