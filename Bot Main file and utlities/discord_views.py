@@ -77,7 +77,7 @@ class TicketLauncherView(BotBoundView):
         super().__init__(bot)
 
     @discord.ui.button(
-        label="Open Ticket",
+        label="Open Purchase Ticket",
         style=discord.ButtonStyle.primary,
         custom_id=TICKET_BUTTON_CUSTOM_ID,
     )
@@ -117,7 +117,7 @@ class PaymentConfirmationView(BotBoundView):
         super().__init__(bot)
 
     @discord.ui.button(
-        label="Confirm Payment",
+        label="Check My Payment",
         style=discord.ButtonStyle.success,
         custom_id=PAYMENT_BUTTON_CUSTOM_ID,
     )

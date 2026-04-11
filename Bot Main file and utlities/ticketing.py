@@ -150,15 +150,16 @@ def build_ticket_catalog_lines() -> str:
 
 def build_script_selection_instruction() -> str:
     return (
-        "Reply with the script's exact name, number, delivery filename, or a clear alias."
+        "Reply with the exact script name, number, delivery filename, or alias."
     )
 
 
 def build_ticket_panel_message() -> str:
     return (
-        "The full asset-backed script catalog is listed below.\n"
-        f"{build_panel_catalog_lines()}\n"
-        "Press the button below to continue with purchase."
+        "Ready to buy a script?\n"
+        "Press `Open Purchase Ticket` below to open a private purchase ticket and start your order.\n\n"
+        "Available scripts:\n"
+        f"{build_panel_catalog_lines()}"
     )
 
 
@@ -168,42 +169,46 @@ def build_support_ticket_panel_message() -> str:
 
 def build_ticket_management_note() -> str:
     return (
-        f'Need a different script before delivery? Type `{CHANGE_SCRIPT_COMMAND}`.\n'
-        f'If you want to start over completely, type `{CLOSE_TICKET_COMMAND}` to close this purchase ticket and then open a new one.\n'
-        f"Completed purchase tickets close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery."
+        "Available actions:\n"
+        f"- Type `{CHANGE_SCRIPT_COMMAND}` to clear your script choice and payment setup before delivery.\n"
+        f"- Type `{CLOSE_TICKET_COMMAND}` to close this purchase ticket. The channel will be deleted a few seconds later.\n"
+        f"- Completed purchase tickets close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery."
     )
 
 
 def build_ticket_store_message(username: str) -> str:
     return (
-        f"Welcome, {username}. This ticket can be used to purchase scripts.\n"
-        "Available scripts, prices, and delivery files:\n"
-        f"{build_ticket_catalog_lines()}\n"
-        f"{build_script_selection_instruction()}\n\n"
+        f"Welcome, {username}. This is your private purchase ticket.\n"
+        f"Do this now: {build_script_selection_instruction()}\n"
+        "What happens next: I will match your script and ask you to confirm it before payment.\n\n"
+        "Script catalog:\n"
+        f"{build_ticket_catalog_lines()}\n\n"
         f"{build_ticket_management_note()}"
     )
 
 
 def build_ticket_retry_message(*, include_confirmation_hint: bool = False) -> str:
     confirmation_hint = (
-        f"\nType {CONFIRM_SELECTION_RESPONSE} to confirm and proceed if the current selection is already correct."
+        f"\nIf the script already shown is correct, type `{CONFIRM_SELECTION_RESPONSE}` exactly to continue."
         if include_confirmation_hint
         else ""
     )
     return (
-        "I couldn't tell which script you want yet.\n"
-        "Available scripts, prices, and delivery files:\n"
-        f"{build_ticket_catalog_lines()}\n"
-        f"{build_script_selection_instruction()}{confirmation_hint}"
+        "I couldn't match that reply to a script yet.\n"
+        f"Do this now: {build_script_selection_instruction()}\n"
+        "What happens next: I will show the script I matched and ask you to confirm it.\n"
+        "You can scroll up in this ticket to see the full catalog again."
+        f"{confirmation_hint}"
     )
 
 
 def build_ticket_change_script_message() -> str:
     return (
-        "Your current script selection has been cleared.\n"
-        "Available scripts, prices, and delivery files:\n"
-        f"{build_ticket_catalog_lines()}\n"
-        f"{build_script_selection_instruction()}\n\n"
+        "Your previous script and payment setup have been cleared.\n"
+        f"Do this now: {build_script_selection_instruction()}\n"
+        "What happens next: I will match your new script and ask you to confirm it before payment.\n\n"
+        "Script catalog:\n"
+        f"{build_ticket_catalog_lines()}\n\n"
         f"{build_ticket_management_note()}"
     )
 
@@ -214,10 +219,13 @@ def build_script_confirmation_message(
     ticket_price_override: str | None = None,
 ) -> str:
     return (
-        "Confirming this is the script you want:\n"
+        "Matched script:\n"
         f"{build_selected_product_price_text(product, ticket_price_override=ticket_price_override)} "
         f"- delivery file: {product.file_path.name}\n"
-        f"Type {CONFIRM_SELECTION_RESPONSE} to confirm and proceed."
+        f"Do this now: type `{CONFIRM_SELECTION_RESPONSE}` exactly to confirm this script.\n"
+        f"Only `{CONFIRM_SELECTION_RESPONSE}` moves you forward.\n"
+        "What happens next: after you confirm, I will show the payment platform button.\n"
+        "If this is the wrong script, reply with the correct script name, number, delivery filename, or alias instead."
     )
 
 
@@ -235,11 +243,11 @@ def build_payment_platform_prompt_message(
         else f"Available right now: {available_platforms}."
     )
     return (
-        "Your script is confirmed as "
-        f"{build_selected_product_price_text(product, ticket_price_override=ticket_price_override)}.\n"
-        "Which payment platform would you like to use?\n"
+        "Script confirmed:\n"
+        f"{build_selected_product_price_text(product, ticket_price_override=ticket_price_override)}\n"
+        "Do this now: press the button below to reveal the exact payment instructions and your note code.\n"
         f"{availability_text}\n"
-        "Select a payment platform below to continue."
+        "What happens next: I will show where to send payment, how much to send, the exact note code, and the button to check your payment."
     )
 
 
@@ -256,28 +264,27 @@ def build_payment_instruction_message(
     ) or "0.00"
     standard_price = normalize_ticket_price_text(product.price) or "0.00"
     payment_amount_instruction = (
-        f"For this ticket, send ${effective_price} for {product.label}."
+        f"Script: {product.label} at the standard ticket price of ${effective_price}."
         if effective_price == standard_price
         else (
-            f"For this ticket, send the admin-set price of ${effective_price} for "
-            f"{product.label} (standard price ${standard_price})."
+            f"Script: {product.label} at the admin-set ticket price of ${effective_price} "
+            f"(standard price ${standard_price})."
         )
     )
     return (
-        f"{platform.label} selected as your payment method.\n"
-        f"Send the amount for the script to the {platform.destination_label} "
-        f"{platform.destination_value}. {payment_amount_instruction}\n\n"
-        "Important: put this exact code in the payment note/message.\n"
-        f"`{payment_note_code}`\n"
-        "Use the code exactly as shown. If the receipt email does not contain this code, "
-        "the product will not be sent automatically.\n\n"
-        "Once the payment is sent, press Confirm Payment below. The system will check for the "
-        f"payment and automatically deliver the `{product.file_path.name}` file within about {PAYMENT_CHECK_DELAY_SECONDS} "
-        "seconds if the payment is detected.\n\n"
-        "If you experience any issues (for example, the full amount was sent but the "
-        "file was not received), please open a support ticket and a moderator will "
-        "assist you shortly.\n\n"
-        "Thank you!"
+        f"{platform.label} payment instructions\n"
+        f"{payment_amount_instruction}\n\n"
+        "Do this now:\n"
+        f"1. Send ${effective_price} to the {platform.destination_label} {platform.destination_value}.\n"
+        f"2. Put this exact code in the payment note: `{payment_note_code}`\n"
+        "3. After you pay, press `Check My Payment` below.\n\n"
+        "Important:\n"
+        f"- The payment note must be exactly `{payment_note_code}`.\n"
+        "- If the code is missing or changed, automatic verification will fail.\n\n"
+        "What happens next:\n"
+        f"- After you press `Check My Payment`, I will check for your payment in about {PAYMENT_CHECK_DELAY_SECONDS} seconds.\n"
+        f"- If payment is detected, I will automatically deliver `{product.file_path.name}`.\n"
+        "- If automatic verification fails after a real payment, open a support ticket from the support panel for manual review."
     )
 
 

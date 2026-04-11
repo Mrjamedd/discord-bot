@@ -139,6 +139,7 @@ ADMIN_SET_PRICE_COMMAND_PREFIXES = (
 ADMIN_RESET_COMMAND_ALIASES = frozenset(
     {"!admin reset-ticket", "!admin reset", "!admin reset ticket", "!admin start over"}
 )
+ADMIN_DELETE_TICKET_COMMAND_ALIASES = frozenset({"!d"})
 ADMIN_DELIVER_COMMAND_PREFIXES = (
     "!admin deliver-file",
     "!admin deliver file",
@@ -228,6 +229,7 @@ class DiscordPurchaseBot(discord.Client):
             "- `!admin price default`: clear the ticket-specific price override and restore the standard script price\n"
             f"- `!admin stage <stage>`: force the ticket stage. Valid stages: {available_stages}\n"
             "- `!admin reset`: clear the script/payment state and return the ticket to selection\n"
+            "- `!D`: delete the current purchase or support ticket channel after a short warning\n"
             "- `!admin deliver [name|number|filename|alias]`: send a file immediately without changing the ticket to completed\n"
             "- `!admin bypass [name|number|filename|alias]`: skip email verification, deliver the file, and mark the ticket completed\n\n"
             "Legacy command names still work."
@@ -346,6 +348,26 @@ class DiscordPurchaseBot(discord.Client):
         lines.append(f"Branch: {branch or 'unknown'}")
         lines.append(f"Commit: {commit or 'unknown'}")
         return "\n".join(lines)
+
+    def build_support_ticket_manual_review_message(self, issue: str) -> str:
+        return (
+            f"{issue} Open a support ticket from the support panel and send your payment platform, "
+            "payment address/account, payment time, and what went wrong in one message for manual review."
+        )
+
+    def build_payment_check_scheduled_message(self) -> str:
+        return (
+            "Payment check scheduled.\n"
+            f"Do this now: wait about {PAYMENT_CHECK_DELAY_SECONDS} seconds.\n"
+            "Please do not press `Check My Payment` again unless I tell you the payment was not detected.\n"
+            "What happens next: I will post the result in this ticket."
+        )
+
+    def build_payment_check_running_message(self) -> str:
+        return (
+            "A payment check is already running for this ticket.\n"
+            "Please wait for the result message before pressing `Check My Payment` again."
+        )
 
     async def audit_admin_event(
         self,
@@ -1026,6 +1048,54 @@ class DiscordPurchaseBot(discord.Client):
         await self.remove_ticket_record(channel.id)
         self.logger.info(
             "purchase_ticket_channel_deleted channel_id=%s timestamp=%s",
+            channel.id,
+            utc_timestamp(),
+        )
+        return True
+
+    async def close_support_ticket_channel(
+        self,
+        channel: discord.TextChannel,
+        *,
+        delete_reason: str,
+        closing_message: str | None = None,
+        grace_period_seconds: int = 0,
+    ) -> bool:
+        if closing_message:
+            try:
+                await channel.send(
+                    closing_message,
+                    allowed_mentions=self.response_allowed_mentions,
+                )
+            except discord.DiscordException:
+                self.logger.exception(
+                    "support_ticket_close_notice_failed channel_id=%s timestamp=%s",
+                    channel.id,
+                    utc_timestamp(),
+                )
+
+        if grace_period_seconds > 0:
+            await asyncio.sleep(grace_period_seconds)
+
+        try:
+            await channel.delete(reason=delete_reason)
+        except discord.NotFound:
+            self.logger.info(
+                "support_ticket_channel_already_deleted channel_id=%s timestamp=%s",
+                channel.id,
+                utc_timestamp(),
+            )
+            return True
+        except discord.DiscordException:
+            self.logger.exception(
+                "support_ticket_channel_delete_failed channel_id=%s timestamp=%s",
+                channel.id,
+                utc_timestamp(),
+            )
+            return False
+
+        self.logger.info(
+            "support_ticket_channel_deleted channel_id=%s timestamp=%s",
             channel.id,
             utc_timestamp(),
         )
@@ -2204,7 +2274,7 @@ class DiscordPurchaseBot(discord.Client):
                 failure_reason="ticket owner could not be resolved",
             )
             await interaction.response.send_message(
-                "I couldn't verify the ticket owner from saved state. Please contact support.",
+                "I couldn't verify the ticket owner from saved state. Please open a support ticket from the support panel if this keeps happening.",
                 ephemeral=True,
             )
             return
@@ -2274,7 +2344,7 @@ class DiscordPurchaseBot(discord.Client):
                 failure_reason="payment platform not chosen",
             )
             await interaction.response.send_message(
-                "Choose a payment platform first before checking payment.",
+                "Choose the payment platform first. That step shows the exact payment instructions and note code you need before checking payment.",
                 ephemeral=True,
             )
             return
@@ -2296,7 +2366,7 @@ class DiscordPurchaseBot(discord.Client):
                 failure_reason="script selection not ready for payment confirmation",
             )
             await interaction.response.send_message(
-                "Confirm your script selection first before checking payment.",
+                "Confirm your script selection first. After that, I will show the payment platform button.",
                 ephemeral=True,
             )
             return
@@ -2316,7 +2386,7 @@ class DiscordPurchaseBot(discord.Client):
                 failure_reason="payment note code missing",
             )
             await interaction.response.send_message(
-                "This ticket is missing its required payment note code. Choose the payment platform again to get the exact code before confirming payment.",
+                "This ticket is missing its required payment note code. Press the payment platform button again to get the exact code before checking payment.",
                 ephemeral=True,
             )
             return
@@ -2337,7 +2407,7 @@ class DiscordPurchaseBot(discord.Client):
                 failure_reason="payment check already running",
             )
             await interaction.response.send_message(
-                "A payment check is already running for this ticket.",
+                self.build_payment_check_running_message(),
                 ephemeral=True,
             )
             return
@@ -2396,10 +2466,7 @@ class DiscordPurchaseBot(discord.Client):
         )
         try:
             await interaction.response.send_message(
-                (
-                    "Payment check scheduled. "
-                    f"I will attempt to confirm the payment in {PAYMENT_CHECK_DELAY_SECONDS} seconds."
-                ),
+                self.build_payment_check_scheduled_message(),
                 ephemeral=True,
             )
         except discord.DiscordException:
@@ -2411,10 +2478,7 @@ class DiscordPurchaseBot(discord.Client):
             )
             try:
                 await channel.send(
-                    (
-                        "Payment check scheduled. "
-                        f"I will attempt to confirm the payment in {PAYMENT_CHECK_DELAY_SECONDS} seconds."
-                    ),
+                    self.build_payment_check_scheduled_message(),
                     allowed_mentions=self.response_allowed_mentions,
                 )
             except discord.DiscordException:
@@ -2472,7 +2536,7 @@ class DiscordPurchaseBot(discord.Client):
                 details={"requested_platform_key": platform_key},
             )
             await interaction.response.send_message(
-                "I couldn't verify the ticket owner from saved state. Please contact support.",
+                "I couldn't verify the ticket owner from saved state. Please open a support ticket from the support panel if this keeps happening.",
                 ephemeral=True,
             )
             return
@@ -2562,7 +2626,7 @@ class DiscordPurchaseBot(discord.Client):
                 failure_reason="payment check already running",
             )
             await interaction.response.send_message(
-                "A payment check is already running for this ticket.",
+                self.build_payment_check_running_message(),
                 ephemeral=True,
             )
             return
@@ -2896,8 +2960,9 @@ class DiscordPurchaseBot(discord.Client):
                 )
                 pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                 message_text = (
-                    "Payment was confirmed, but I couldn't determine which script was "
-                    "selected. Please contact support."
+                    self.build_support_ticket_manual_review_message(
+                        "Payment was confirmed, but I could not determine which script was selected."
+                    )
                 )
                 await self.audit_purchase_event(
                     "support_escalation_triggered",
@@ -2931,9 +2996,9 @@ class DiscordPurchaseBot(discord.Client):
                 try:
                     await channel.send(
                         (
-                            f"Payment confirmed for {selected_product.label}. "
-                            f"Here is your `{selected_product.file_path.name}` file.\n\n"
-                            f"This purchase ticket will close automatically in {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes. "
+                            f"Payment confirmed for {selected_product.label}.\n"
+                            f"Here is your `{selected_product.file_path.name}` file.\n"
+                            f"What happens next: this purchase ticket will close automatically in {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes.\n"
                             "If you need another script after that, open a new ticket from the panel."
                         ),
                         file=build_script_delivery_file(selected_product),
@@ -3013,8 +3078,9 @@ class DiscordPurchaseBot(discord.Client):
                     )
                     pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                     message_text = (
-                        "Payment was confirmed, but the delivery file is missing right "
-                        "now. Please contact support."
+                        self.build_support_ticket_manual_review_message(
+                            "Payment was confirmed, but the delivery file is missing right now."
+                        )
                     )
                     await self.audit_purchase_event(
                         "file_delivery_failed",
@@ -3061,8 +3127,9 @@ class DiscordPurchaseBot(discord.Client):
                     )
                     pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                     message_text = (
-                        "Payment was confirmed, but I couldn't send the delivery file right "
-                        "now. Please contact support."
+                        self.build_support_ticket_manual_review_message(
+                            "Payment was confirmed, but I could not send the delivery file right now."
+                        )
                     )
                     await self.audit_purchase_event(
                         "file_delivery_failed",
@@ -3109,8 +3176,9 @@ class DiscordPurchaseBot(discord.Client):
                     )
                     pending_ticket_record = await self.get_ticket_record_snapshot(channel.id)
                     message_text = (
-                        "Payment was confirmed, but I couldn't finish the delivery flow right "
-                        "now. Please contact support."
+                        self.build_support_ticket_manual_review_message(
+                            "Payment was confirmed, but I could not finish the delivery flow right now."
+                        )
                     )
                     await self.audit_purchase_event(
                         "file_delivery_failed",
@@ -3271,51 +3339,49 @@ class DiscordPurchaseBot(discord.Client):
         auth_summary = cast(str | None, parser_result.get("auth_summary"))
         if reason == "no candidate messages found":
             return (
-                "Payment was not detected in the recent inbox window yet. If you just paid, "
-                "wait a moment and press Confirm Payment again. If the payment already went "
-                "through, open a support ticket for manual review."
+                "Automatic verification did not find your payment in the recent inbox window yet.\n"
+                "Do this now: if you just paid, wait a moment and press `Check My Payment` again.\n"
+                "What happens next: if the payment has already gone through and it still is not detected, open a support ticket from the support panel for manual review."
             )
         if reason == "payment note code unavailable":
             return (
                 "This ticket is missing its required payment note code. Choose the payment platform again "
-                "and use the exact code shown before confirming payment."
+                "and use the exact code shown before checking payment."
             )
         if reason == "payment note missing":
             payment_note = cast(str | None, parser_result.get("expected_payment_note"))
             if payment_note:
                 return (
-                    f"The receipt email did not contain the required payment code `{payment_note}`. "
-                    "Send payment with that exact code in the note or open a support ticket for manual review."
+                    f"Automatic verification could not find the required payment code `{payment_note}` in the receipt email.\n"
+                    f"Do this now: send the payment with that exact note code `{payment_note}`.\n"
+                    "What happens next: if you already paid without that exact code, open a support ticket from the support panel for manual review."
                 )
         if reason == "sender domain not allowed":
             allowed_text = ", ".join(allowed_sender_domains) if allowed_sender_domains else "the approved list"
             if from_domain:
-                return (
-                    f"Automatic payment confirmation rejected the sender domain `{from_domain}`. "
-                    f"Allowed sender domains are `{allowed_text}`. If the payment was real, open a support ticket for manual review."
+                return self.build_support_ticket_manual_review_message(
+                    f"Automatic verification could not approve the receipt source `{from_domain}`. Approved sender domains: `{allowed_text}`."
                 )
         if reason == "sender subdomain not explicitly approved":
             allowed_text = ", ".join(allowed_sender_subdomains) if allowed_sender_subdomains else "the approved subdomain list"
             if from_domain:
-                return (
-                    f"Automatic payment confirmation rejected the sender subdomain `{from_domain}`. "
-                    f"Approved sender subdomains are `{allowed_text}`. If the payment was real, open a support ticket for manual review."
+                return self.build_support_ticket_manual_review_message(
+                    f"Automatic verification could not approve the receipt source `{from_domain}`. Approved sender subdomains: `{allowed_text}`."
                 )
         if reason == "authentication failure" and auth_summary:
-            return (
-                f"Automatic payment confirmation could not verify the sender authentication ({auth_summary}). "
-                "If the payment was real, open a support ticket for manual review."
+            return self.build_support_ticket_manual_review_message(
+                f"Automatic verification could not verify the sender authentication ({auth_summary})."
             )
         if reason == "amount short":
             shortfall = cast(str | None, parser_result.get("amount_shortfall"))
             if shortfall:
                 return (
-                    f"Your payment is ${shortfall} short. Send the remaining ${shortfall} "
-                    "or open a support ticket for a refund."
+                    f"Automatic verification found a payment, but it is ${shortfall} short.\n"
+                    f"Do this now: send the remaining ${shortfall} with the correct note code, then press `Check My Payment` again.\n"
+                    "What happens next: if you need manual help instead, open a support ticket from the support panel."
                 )
-        return (
-            f"Automatic payment confirmation did not pass ({reason}). If the payment was "
-            "already sent, please open a support ticket for manual review."
+        return self.build_support_ticket_manual_review_message(
+            f"Automatic verification could not complete successfully ({reason})."
         )
 
     async def send_response(self, message: discord.Message, text: str) -> None:
@@ -3895,7 +3961,10 @@ class DiscordPurchaseBot(discord.Client):
     async def handle_admin_command(self, message: discord.Message) -> bool:
         raw_command = message.content.strip()
         lower_command = raw_command.lower()
-        if not lower_command.startswith("!admin"):
+        if not (
+            lower_command.startswith("!admin")
+            or lower_command in ADMIN_DELETE_TICKET_COMMAND_ALIASES
+        ):
             return False
 
         channel = message.channel if isinstance(message.channel, discord.TextChannel) else None
@@ -4003,6 +4072,183 @@ class DiscordPurchaseBot(discord.Client):
                 details={"version_message": version_message},
             )
             await self.send_response(message, version_message)
+            return True
+
+        if lower_command in ADMIN_DELETE_TICKET_COMMAND_ALIASES:
+            if channel is None:
+                await self.audit_admin_event(
+                    "admin_ticket_delete_rejected",
+                    status="failure",
+                    message=message,
+                    channel=channel,
+                    failure_reason="admin delete requires text channel",
+                )
+                await self.send_response(
+                    message,
+                    "This admin delete command only works inside a purchase or support ticket channel.",
+                )
+                return True
+
+            if self.is_purchase_ticket_channel(channel):
+                owner_id = await self.get_authoritative_ticket_owner_id(channel)
+                ticket_record = await self.get_ticket_record_snapshot(
+                    channel.id,
+                    owner_id=owner_id,
+                )
+                ticket_stage = cast(
+                    str,
+                    ticket_record.get("stage", TICKET_STAGE_AWAITING_SELECTION),
+                )
+                current_product = get_script_product_by_key(
+                    cast(str | None, ticket_record.get("selected_script_key"))
+                )
+                current_platform = get_payment_platform_by_key(
+                    cast(str | None, ticket_record.get("payment_platform_key"))
+                )
+                current_payment_note_code = cast(
+                    str | None,
+                    ticket_record.get("payment_note_code"),
+                )
+
+                if ticket_stage == TICKET_STAGE_PAYMENT_PENDING:
+                    await self.audit_admin_event(
+                        "admin_ticket_delete_rejected",
+                        status="failure",
+                        message=message,
+                        channel=channel,
+                        ticket_owner_id=owner_id,
+                        ticket_record=ticket_record,
+                        ticket_stage=ticket_stage,
+                        product=current_product,
+                        platform=current_platform,
+                        payment_note_code=current_payment_note_code,
+                        failure_reason="admin delete requested while payment check was running",
+                    )
+                    await self.send_response(
+                        message,
+                        "A payment check is already running for this ticket. Please wait for the result message before using `!D`.",
+                    )
+                    return True
+
+                await self.audit_admin_event(
+                    "admin_ticket_delete_requested",
+                    status="success",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    product=current_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                )
+                closed_ok = await self.close_purchase_ticket_channel(
+                    channel,
+                    delete_reason=(
+                        f"Purchase ticket deleted by admin command from {message.author} ({message.author.id})"
+                    ),
+                    closing_message=(
+                        "Admin delete requested. This purchase ticket will be deleted in a few seconds."
+                    ),
+                    grace_period_seconds=3,
+                )
+                await self.audit_admin_event(
+                    "admin_ticket_deleted",
+                    status="success" if closed_ok else "failure",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    product=current_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    failure_reason="" if closed_ok else "purchase ticket delete failed",
+                )
+                await self.audit_purchase_event(
+                    "purchase_ticket_closed",
+                    event_category="ticket",
+                    status="success" if closed_ok else "failure",
+                    trigger=ADMIN_COMMAND_TRIGGER,
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    ticket_record=ticket_record,
+                    ticket_stage=ticket_stage,
+                    product=current_product,
+                    platform=current_platform,
+                    payment_note_code=current_payment_note_code,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalize_text(message.content),
+                    failure_reason="" if closed_ok else "purchase ticket close failed from admin delete",
+                )
+                if not closed_ok:
+                    await self.send_response(
+                        message,
+                        "I couldn't delete this purchase ticket right now. Please try again.",
+                    )
+                return True
+
+            if self.is_support_ticket_channel(channel):
+                owner_id = ticket_owner_id_from_topic(channel.topic)
+                if owner_id is None:
+                    owner_id = self.infer_ticket_owner_id_from_overwrites(channel)
+
+                await self.audit_admin_event(
+                    "admin_ticket_delete_requested",
+                    status="success",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                )
+                closed_ok = await self.close_support_ticket_channel(
+                    channel,
+                    delete_reason=(
+                        f"Support ticket deleted by admin command from {message.author} ({message.author.id})"
+                    ),
+                    closing_message=(
+                        "Admin delete requested. This support ticket will be deleted in a few seconds."
+                    ),
+                    grace_period_seconds=3,
+                )
+                await self.audit_admin_event(
+                    "admin_ticket_deleted",
+                    status="success" if closed_ok else "failure",
+                    message=message,
+                    channel=channel,
+                    ticket_owner_id=owner_id,
+                    failure_reason="" if closed_ok else "support ticket delete failed",
+                )
+                await self.audit_purchase_event(
+                    "support_ticket_closed",
+                    event_category="support",
+                    status="success" if closed_ok else "failure",
+                    trigger=ADMIN_COMMAND_TRIGGER,
+                    channel=channel,
+                    message=message,
+                    ticket_owner_id=owner_id,
+                    raw_user_input=message.content,
+                    normalized_user_input=normalize_text(message.content),
+                    failure_reason="" if closed_ok else "support ticket close failed from admin delete",
+                )
+                if not closed_ok:
+                    await self.send_response(
+                        message,
+                        "I couldn't delete this support ticket right now. Please try again.",
+                    )
+                return True
+
+            await self.audit_admin_event(
+                "admin_ticket_delete_rejected",
+                status="failure",
+                message=message,
+                channel=channel,
+                failure_reason="admin delete requires ticket channel",
+            )
+            await self.send_response(
+                message,
+                "This admin delete command only works inside a purchase or support ticket channel.",
+            )
             return True
 
         selection = self.admin_command_argument(
@@ -4626,7 +4872,7 @@ class DiscordPurchaseBot(discord.Client):
             )
             await self.send_response(
                 message,
-                "I couldn't verify the ticket owner for this channel. Please contact support.",
+                "I couldn't verify the ticket owner for this channel. Please open a support ticket from the support panel if you still need help.",
             )
             return
         if owner_id is not None and message.author.id != owner_id:
@@ -4691,7 +4937,7 @@ class DiscordPurchaseBot(discord.Client):
                 )
                 await self.send_response(
                     message,
-                    "A payment check is already running for this ticket, so it can't be closed right now. Please wait for that check to finish.",
+                    "A payment check is already running for this ticket, so it can't be closed right now. Please wait for the result message first.",
                 )
                 return
 
@@ -4716,8 +4962,8 @@ class DiscordPurchaseBot(discord.Client):
                     f"Purchase ticket closed by {message.author} ({message.author.id})"
                 ),
                 closing_message=(
-                    "Closing this purchase ticket now. "
-                    "You can open a new one from the panel whenever you're ready."
+                    "Closing this purchase ticket now. This channel will be deleted in a few seconds.\n"
+                    "If you need another script later, open a new ticket from the panel."
                 ),
                 grace_period_seconds=3,
             )
@@ -4740,7 +4986,7 @@ class DiscordPurchaseBot(discord.Client):
             if not closed_ok:
                 await self.send_response(
                     message,
-                    "I couldn't close this purchase ticket right now. Please try again or contact support.",
+                    "I couldn't close this purchase ticket right now. Please try again, or open a support ticket from the support panel if you still need help.",
                 )
             return
 
@@ -4764,7 +5010,7 @@ class DiscordPurchaseBot(discord.Client):
                 )
                 await self.send_response(
                     message,
-                    "A payment check is already running for this ticket, so the script can't be changed right now. Please wait for that check to finish.",
+                    "A payment check is already running for this ticket, so the script can't be changed right now. Please wait for the result message first.",
                 )
                 return
 
@@ -4787,8 +5033,9 @@ class DiscordPurchaseBot(discord.Client):
                 await self.send_response(
                     message,
                     (
-                        "This purchase ticket is already completed. "
-                        f"It will close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery, or you can type `close ticket` now and open a new one."
+                        "This ticket is already completed.\n"
+                        f"What happens next: it will close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery.\n"
+                        "If you need another script sooner, type `close ticket` and open a new one."
                     ),
                 )
                 return
@@ -5094,9 +5341,9 @@ class DiscordPurchaseBot(discord.Client):
                 await self.send_response(
                     message,
                     (
-                        f"Payment has already been confirmed for {current_product.label} in this ticket. "
-                        f"This purchase ticket will close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery. "
-                        "You can also type `close ticket` now and open a new one."
+                        f"This ticket is already completed for {current_product.label}.\n"
+                        f"What happens next: it will close automatically {PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes after delivery.\n"
+                        "If you need another script sooner, type `close ticket` and open a new one."
                     ),
                 )
                 return
@@ -5118,7 +5365,7 @@ class DiscordPurchaseBot(discord.Client):
                 )
                 await self.send_response(
                     message,
-                    "A payment check is already running for this ticket.",
+                    self.build_payment_check_running_message(),
                 )
                 return
 
@@ -5144,14 +5391,15 @@ class DiscordPurchaseBot(discord.Client):
             await self.send_response(
                 message,
                 (
-                    f"Your script is confirmed as {current_product.label} for ${effective_price}. "
-                    f"{current_platform.label} is selected. "
-                    f"Use the exact payment note code `{current_payment_note_code or 'missing'}` and press Confirm Payment when you're ready."
+                    f"Your script is confirmed as {current_product.label} for ${effective_price}.\n"
+                    f"What to do now: send payment through {current_platform.label} using the exact note code `{current_payment_note_code or 'missing'}`.\n"
+                    "What happens next: after you pay, press `Check My Payment`."
                 )
                 if current_platform is not None
                 else (
-                    f"Your script is confirmed as {current_product.label} for ${effective_price}. "
-                    "Press Confirm Payment when you're ready."
+                    f"Your script is confirmed as {current_product.label} for ${effective_price}.\n"
+                    "What to do now: press the payment platform button to view your payment instructions.\n"
+                    "What happens next: I will show where to send payment, the exact note code, and the button to check your payment."
                 ),
             )
             return

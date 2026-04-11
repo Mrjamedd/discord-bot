@@ -184,15 +184,16 @@ PAYMENT_CHECK_DELAY_SECONDS = 40
 CASH_APP_CASHTAG = os.getenv("CASH_APP_CASHTAG", "$CHANGE_ME").strip() or "$CHANGE_ME"
 CONFIRM_SELECTION_RESPONSE = "yes"
 SUPPORT_TICKET_PANEL_MESSAGE = (
-    "Sorry things didn’t go as planned. Click the button below to talk it through with a moderator."
+    "Need help with payment or delivery?\n"
+    "Press the button below to open a private support ticket and message a moderator."
 )
 SUPPORT_TICKET_CHANNEL_MESSAGE = (
     f"<@&{SUPPORT_MODERATOR_ROLE_ID}>\n"
     "A new support ticket has been opened.\n\n"
-    "Sorry things didn’t go as planned. When opening a support ticket, please include "
-    "the following information so we can help you as quickly as possible:\n\n"
-    "• The platform you used\n"
-    "• Your account name or the payment address used to send the payment\n"
-    "• The time the payment was sent\n\n"
+    "Please send the following details in one message right away so we can review this faster:\n\n"
+    "- The platform you used\n"
+    "- Your account name or the payment address used to send the payment\n"
+    "- The time the payment was sent\n"
+    "- What went wrong\n\n"
     "A moderator will review your message and assist you shortly."
 )

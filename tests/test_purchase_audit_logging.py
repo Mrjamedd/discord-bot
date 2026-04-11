@@ -3,13 +3,17 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULE_DIR = REPO_ROOT / "Bot Main file and utlities"
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
+from bot import DiscordPurchaseBot
 from models import ScriptProduct
 from purchase_audit_logger import PURCHASE_AUDIT_COLUMNS, _build_purchase_audit_row
 from ticketing import (
@@ -19,6 +23,7 @@ from ticketing import (
     build_script_confirmation_message,
     build_ticket_change_script_message,
     build_ticket_catalog_lines,
+    build_ticket_panel_message,
     build_ticket_retry_message,
     build_ticket_store_message,
     message_requests_script_change,
@@ -67,7 +72,7 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
     def test_ticket_retry_message_can_include_confirmation_hint(self) -> None:
         retry_message = build_ticket_retry_message(include_confirmation_hint=True)
 
-        self.assertIn("Type yes to confirm and proceed", retry_message)
+        self.assertIn("type `yes` exactly to continue", retry_message)
         self.assertIn("delivery filename", retry_message)
 
     def test_ticket_store_message_includes_change_and_close_note(self) -> None:
@@ -75,16 +80,23 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
 
         self.assertIn("`change script`", ticket_store_message)
         self.assertIn("`close ticket`", ticket_store_message)
+        self.assertIn("Do this now:", ticket_store_message)
         self.assertIn(
             f"{PURCHASE_TICKET_AUTO_CLOSE_MINUTES} minutes",
             ticket_store_message,
         )
 
+    def test_ticket_panel_message_is_action_first(self) -> None:
+        panel_message = build_ticket_panel_message()
+
+        self.assertIn("Ready to buy a script?", panel_message)
+        self.assertIn("`Open Purchase Ticket`", panel_message)
+
     def test_ticket_change_script_message_repeats_management_note(self) -> None:
         change_script_message = build_ticket_change_script_message()
 
         self.assertIn(
-            "Your current script selection has been cleared",
+            "Your previous script and payment setup have been cleared",
             change_script_message,
         )
         self.assertIn("`change script`", change_script_message)
@@ -122,6 +134,7 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
         self.assertIn("$12.50", message)
         self.assertIn("standard price $23.00", message)
         self.assertIn("ZEN-AB12CD", message)
+        self.assertIn("Check My Payment", message)
 
     def test_ticket_management_commands_are_normalized(self) -> None:
         self.assertTrue(message_requests_script_change("Change Script"))
@@ -171,6 +184,48 @@ class PurchaseAuditLoggingTests(unittest.TestCase):
         self.assertEqual("ambiguous", result.status)
         self.assertIsNone(result.product)
         self.assertGreaterEqual(len(result.candidate_keys), 2)
+
+
+class AdminCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admin_delete_command_closes_purchase_ticket(self) -> None:
+        bot = object.__new__(DiscordPurchaseBot)
+        bot.is_admin_bypass_user = lambda user: True
+        bot.is_purchase_ticket_channel = lambda channel: True
+        bot.is_support_ticket_channel = lambda channel: False
+        bot.get_authoritative_ticket_owner_id = AsyncMock(return_value=123456)
+        bot.get_ticket_record_snapshot = AsyncMock(
+            return_value={
+                "stage": "awaiting_selection",
+                "selected_script_key": None,
+                "payment_platform_key": None,
+                "payment_note_code": None,
+            }
+        )
+        bot.close_purchase_ticket_channel = AsyncMock(return_value=True)
+        bot.audit_admin_event = AsyncMock()
+        bot.audit_purchase_event = AsyncMock()
+        bot.send_response = AsyncMock()
+
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 321
+        message = SimpleNamespace(
+            content="!D",
+            channel=channel,
+            author=SimpleNamespace(
+                id=999,
+                name="reports0486",
+                display_name="ciga",
+            ),
+        )
+
+        handled = await DiscordPurchaseBot.handle_admin_command(bot, message)
+
+        self.assertTrue(handled)
+        bot.close_purchase_ticket_channel.assert_awaited_once()
+        _, kwargs = bot.close_purchase_ticket_channel.await_args
+        self.assertEqual(3, kwargs["grace_period_seconds"])
+        self.assertIn("deleted in a few seconds", kwargs["closing_message"])
+        bot.send_response.assert_not_awaited()
 
 
 if __name__ == "__main__":
