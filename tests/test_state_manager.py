@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULE_DIR = REPO_ROOT / "Bot Main file and utlities"
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
-from state_manager import _coerce_ticket_record, fresh_ticket_record
+import state_manager
+from state_manager import (
+    _coerce_ticket_record,
+    fresh_ticket_record,
+    load_state_result,
+    save_state,
+)
 
 
 class TicketStateManagerTests(unittest.TestCase):
@@ -59,6 +68,67 @@ class TicketStateManagerTests(unittest.TestCase):
         )
 
         self.assertIsNone(record["ticket_price_override"])
+
+    def test_load_state_result_falls_back_to_backup_when_primary_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            backup_file = Path(temp_dir) / "state.backup.json"
+            state_file.write_text("{not valid json", encoding="utf-8")
+            backup_file.write_text(
+                json.dumps(
+                    {
+                        "tickets": {
+                            "123": {
+                                "owner_id": 99,
+                                "stage": "awaiting_selection",
+                            }
+                        },
+                        "payment_parser": {"consumed_message_ids": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(state_manager, "STATE_FILE", state_file), patch.object(
+                state_manager,
+                "STATE_BACKUP_FILE",
+                backup_file,
+            ):
+                result = load_state_result()
+                archived_files = list(Path(temp_dir).glob("state.corrupt-*.json"))
+
+        self.assertEqual("backup", result.source)
+        self.assertEqual(99, result.state["tickets"]["123"]["owner_id"])
+        self.assertTrue(
+            any("Recovered bot state from backup file" in warning for warning in result.warnings)
+        )
+        self.assertEqual(1, len(archived_files))
+
+    def test_save_state_writes_primary_and_backup_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            backup_file = Path(temp_dir) / "state.backup.json"
+            state = {
+                "tickets": {
+                    "123": {
+                        "owner_id": 99,
+                        "stage": "awaiting_selection",
+                    }
+                },
+                "payment_parser": {"consumed_message_ids": {}},
+            }
+
+            with patch.object(state_manager, "STATE_FILE", state_file), patch.object(
+                state_manager,
+                "STATE_BACKUP_FILE",
+                backup_file,
+            ):
+                save_state(state)
+
+            self.assertEqual(
+                json.loads(state_file.read_text(encoding="utf-8")),
+                json.loads(backup_file.read_text(encoding="utf-8")),
+            )
 
 
 if __name__ == "__main__":

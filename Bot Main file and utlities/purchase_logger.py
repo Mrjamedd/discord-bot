@@ -4,6 +4,9 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from threading import Lock
 from typing import Any, cast
@@ -22,6 +25,23 @@ from config import (
 )
 from models import PURCHASE_LOG_COLUMNS, PurchaseRecord
 from utils import ensure_parent_directory, utc_timestamp
+
+
+@dataclass(frozen=True)
+class PaymentMethodSummary:
+    label: str
+    sales_count: int
+    revenue: Decimal
+
+
+@dataclass(frozen=True)
+class SalesSummary:
+    period_start_utc: datetime
+    period_end_utc: datetime
+    total_sales_count: int
+    total_revenue: Decimal
+    payment_method_breakdown: tuple[PaymentMethodSummary, ...]
+
 
 class PurchaseLogger:
     def __init__(self, logger: logging.Logger) -> None:
@@ -180,6 +200,58 @@ class PurchaseLogger:
                 pending_records.pop(purchase_event_id, None)
         return pending_records
 
+    def _load_local_records_unlocked(self) -> list[PurchaseRecord]:
+        records: list[PurchaseRecord] = []
+        ensure_parent_directory(self.purchase_log_file)
+        try:
+            self.purchase_log_file.touch(exist_ok=True)
+            lines = self.purchase_log_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            self.logger.exception(
+                "purchase_log_local_read_failed path=%s",
+                self.purchase_log_file,
+            )
+            return records
+
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                self.logger.error(
+                    "purchase_log_local_line_invalid path=%s line_number=%s",
+                    self.purchase_log_file,
+                    line_number,
+                )
+                continue
+            if not isinstance(payload, dict):
+                self.logger.error(
+                    "purchase_log_local_record_invalid path=%s line_number=%s",
+                    self.purchase_log_file,
+                    line_number,
+                )
+                continue
+            records.append(cast(PurchaseRecord, payload))
+        return records
+
+    def _load_recoverable_sales_records_unlocked(self) -> list[PurchaseRecord]:
+        merged_records: dict[str, PurchaseRecord] = {}
+
+        for index, record in enumerate(self._load_local_records_unlocked(), start=1):
+            purchase_event_id = record.get("Purchase Event ID")
+            record_key = (
+                purchase_event_id
+                if isinstance(purchase_event_id, str) and purchase_event_id.strip()
+                else f"local-record-{index}"
+            )
+            merged_records.setdefault(record_key, record)
+
+        for purchase_event_id, record in self._load_pending_records_unlocked().items():
+            merged_records.setdefault(purchase_event_id, record)
+
+        return list(merged_records.values())
+
     def _queue_purchase_record_unlocked(self, record: PurchaseRecord) -> bool:
         purchase_event_id = record["Purchase Event ID"]
         pending_records = self._load_pending_records_unlocked()
@@ -250,6 +322,73 @@ class PurchaseLogger:
                 self.purchase_log_file,
             )
             return False
+
+    def load_local_records(self) -> list[PurchaseRecord]:
+        with self._lock:
+            return self._load_local_records_unlocked()
+
+    def summarize_sales(
+        self,
+        *,
+        period_start_utc: datetime,
+        period_end_utc: datetime,
+    ) -> SalesSummary:
+        normalized_start = _normalize_utc_datetime(period_start_utc)
+        normalized_end = _normalize_utc_datetime(period_end_utc)
+        payment_method_breakdown: dict[str, tuple[int, Decimal]] = {}
+        total_sales_count = 0
+        total_revenue = Decimal("0.00")
+
+        with self._lock:
+            records = self._load_recoverable_sales_records_unlocked()
+
+        for record in records:
+            record_timestamp = _parse_record_timestamp(record)
+            if record_timestamp is None or not (
+                normalized_start <= record_timestamp < normalized_end
+            ):
+                continue
+
+            price_paid = _parse_record_price(record)
+            if price_paid is None:
+                self.logger.warning(
+                    "purchase_log_price_invalid purchase_event_id=%s price_paid=%r",
+                    record.get("Purchase Event ID"),
+                    record.get("Price Paid"),
+                )
+                continue
+
+            total_sales_count += 1
+            total_revenue += price_paid
+
+            payment_method = _payment_method_label(record)
+            existing_count, existing_revenue = payment_method_breakdown.get(
+                payment_method,
+                (0, Decimal("0.00")),
+            )
+            payment_method_breakdown[payment_method] = (
+                existing_count + 1,
+                existing_revenue + price_paid,
+            )
+
+        sorted_breakdown = tuple(
+            PaymentMethodSummary(
+                label=label,
+                sales_count=count,
+                revenue=revenue,
+            )
+            for label, (count, revenue) in sorted(
+                payment_method_breakdown.items(),
+                key=lambda item: (-item[1][0], item[0].lower()),
+            )
+        )
+        return SalesSummary(
+            period_start_utc=normalized_start,
+            period_end_utc=normalized_end,
+            total_sales_count=total_sales_count,
+            total_revenue=total_revenue,
+            payment_method_breakdown=sorted_breakdown,
+        )
 
     def _get_sheet_titles(self, sheets_service: Any) -> dict[str, int]:
         response = (
@@ -558,3 +697,38 @@ class PurchaseLogger:
                 if local_ok and sheet_ok:
                     synced_records += 1
             return synced_records, total_records
+
+
+def _normalize_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_record_timestamp(record: PurchaseRecord) -> datetime | None:
+    raw_timestamp = record.get("Exact Timestamp")
+    if not isinstance(raw_timestamp, str) or not raw_timestamp.strip():
+        return None
+    try:
+        parsed_timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return None
+    return _normalize_utc_datetime(parsed_timestamp)
+
+
+def _parse_record_price(record: PurchaseRecord) -> Decimal | None:
+    raw_price = record.get("Price Paid")
+    if raw_price is None:
+        return None
+    try:
+        return Decimal(str(raw_price).replace("$", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _payment_method_label(record: PurchaseRecord) -> str:
+    for key in ("Payment Method", "Payment Method Key"):
+        raw_value = record.get(key)
+        if isinstance(raw_value, str) and raw_value.strip():
+            return raw_value.strip()
+    return "Unknown"

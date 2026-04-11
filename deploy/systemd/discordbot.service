@@ -22,9 +22,19 @@ ExecStart=/opt/discord-purchase-bot/deploy/systemd/start_bot.sh
 SyslogIdentifier=discordbot
 StandardOutput=journal
 StandardError=journal
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=900
+TimeoutStopSec=60
+KillSignal=SIGINT
 
 [Install]
 WantedBy=multi-user.target

@@ -8,15 +8,23 @@ from decimal import Decimal
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 
 from Email_Parser import check_payment_email
+from admin_email import AdminEmailNotifier
 from config import (
+    WEEKLY_SALES_REPORT_HOUR,
+    WEEKLY_SALES_REPORT_MINUTE,
+    WEEKLY_SALES_REPORT_TIMEZONE,
+    WEEKLY_SALES_REPORT_WEEKDAY,
     PAYMENT_BUTTON_CUSTOM_ID,
     PAYMENT_CHECK_DELAY_SECONDS,
     PAYMENT_PARSER_EXPECTED_AMOUNT,
+    PAYMENT_PARSER_TIMEOUT_SECONDS,
     PURCHASE_SYNC_RETRY_INTERVAL_SECONDS,
+    STATE_SAVE_RETRY_INTERVAL_SECONDS,
     SUPPORT_MODERATOR_ROLE_ID,
     SUPPORT_TICKET_BUTTON_CUSTOM_ID,
     SUPPORT_TICKET_CATEGORY_ID,
@@ -42,12 +50,13 @@ from models import (
     TicketRecord,
 )
 from purchase_audit_logger import PurchaseFlowAuditLogger
-from purchase_logger import PurchaseLogger
+from purchase_logger import PurchaseLogger, SalesSummary
 from state_manager import (
     fresh_ticket_record,
     get_payment_parser_state,
     get_ticket_record,
     load_state,
+    load_state_result,
     purge_consumed_message_ids,
     record_consumed_message_id,
     save_state,
@@ -98,6 +107,20 @@ from utils import (
 ADMIN_BYPASS_USERNAME = "reports0486"
 ADMIN_BYPASS_DISPLAY_NAME = "ciga"
 ADMIN_COMMAND_TRIGGER = "admin_bypass"
+EMAIL_TEST_COMMAND_ALIASES = frozenset({"!emailtest"})
+EMAIL_TEST_SUBJECT = "IMPORTANT - Email System Test"
+EMAIL_TEST_BODY = "Confirm that the mail server is successfully linked to the bot."
+SUPPORT_TICKET_ALERT_SUBJECT = "URGENT - New Support Ticket Opened"
+WEEKLY_SALES_REPORT_SUBJECT = "MUST READ - Weekly Sales Summary Report"
+WEEKDAY_NAME_TO_NUMBER = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
 ADMIN_COMMAND_LIST = "!admin help"
 ADMIN_COMMAND_LIST_ALIASES = frozenset(
     {
@@ -160,6 +183,7 @@ class DiscordPurchaseBot(discord.Client):
         logger: logging.Logger,
         purchase_logger: PurchaseLogger,
         audit_logger: PurchaseFlowAuditLogger,
+        admin_email_notifier: AdminEmailNotifier | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -167,6 +191,7 @@ class DiscordPurchaseBot(discord.Client):
         self.logger = logger
         self.purchase_logger = purchase_logger
         self.audit_logger = audit_logger
+        self.admin_email_notifier = admin_email_notifier or AdminEmailNotifier(logger)
         self.response_allowed_mentions: discord.AllowedMentions = (
             discord.AllowedMentions.none()
         )
@@ -176,7 +201,15 @@ class DiscordPurchaseBot(discord.Client):
             roles=True,
             replied_user=False,
         )
-        self.state: BotState = load_state()
+        if getattr(load_state, "__module__", "") != "state_manager":
+            self.state = load_state()
+            self.state_load_source = "patched"
+            state_load_warnings: tuple[str, ...] = ()
+        else:
+            state_load_result = load_state_result()
+            self.state = state_load_result.state
+            self.state_load_source = state_load_result.source
+            state_load_warnings = state_load_result.warnings
         self.state_lock = asyncio.Lock()
         self.ticket_panel_lock = asyncio.Lock()
         self.ticket_creation_lock = asyncio.Lock()
@@ -186,8 +219,13 @@ class DiscordPurchaseBot(discord.Client):
         self.pending_payment_check_channel_ids: set[int] = set()
         self.purchase_sync_lock = asyncio.Lock()
         self.purchase_sync_retry_task: asyncio.Task[None] | None = None
+        self.weekly_sales_report_task: asyncio.Task[None] | None = None
+        self.state_save_retry_task: asyncio.Task[None] | None = None
         self.purchase_ticket_auto_close_tasks: dict[int, asyncio.Task[None]] = {}
         self.payment_parser_lock = asyncio.Lock()
+        self.state_save_failed = False
+        for warning in state_load_warnings:
+            self.logger.warning("state_load_warning %s", warning)
 
     def build_ticket_panel_view(self) -> TicketLauncherView:
         return TicketLauncherView(self)
@@ -200,6 +238,306 @@ class DiscordPurchaseBot(discord.Client):
 
     def build_payment_confirmation_view(self) -> PaymentConfirmationView:
         return PaymentConfirmationView(self)
+
+    @staticmethod
+    def format_currency(value: Decimal) -> str:
+        return f"${value.quantize(Decimal('0.01'))}"
+
+    def message_author_is_administrator(self, message: discord.Message) -> bool:
+        permissions = getattr(message.author, "guild_permissions", None)
+        return bool(getattr(permissions, "administrator", False))
+
+    def weekly_report_timezone(self) -> timezone | ZoneInfo:
+        try:
+            return ZoneInfo(WEEKLY_SALES_REPORT_TIMEZONE)
+        except ZoneInfoNotFoundError:
+            self.logger.warning(
+                "weekly_sales_report_timezone_invalid value=%r fallback=%s",
+                WEEKLY_SALES_REPORT_TIMEZONE,
+                "UTC",
+            )
+            return timezone.utc
+
+    def weekly_report_weekday(self) -> int:
+        resolved_weekday = WEEKDAY_NAME_TO_NUMBER.get(WEEKLY_SALES_REPORT_WEEKDAY)
+        if resolved_weekday is not None:
+            return resolved_weekday
+        self.logger.warning(
+            "weekly_sales_report_weekday_invalid value=%r fallback=%s",
+            WEEKLY_SALES_REPORT_WEEKDAY,
+            "monday",
+        )
+        return WEEKDAY_NAME_TO_NUMBER["monday"]
+
+    def weekly_report_time(self) -> tuple[int, int]:
+        hour = WEEKLY_SALES_REPORT_HOUR
+        minute = WEEKLY_SALES_REPORT_MINUTE
+        if not 0 <= hour <= 23:
+            self.logger.warning(
+                "weekly_sales_report_hour_invalid value=%s fallback=%s",
+                hour,
+                9,
+            )
+            hour = 9
+        if not 0 <= minute <= 59:
+            self.logger.warning(
+                "weekly_sales_report_minute_invalid value=%s fallback=%s",
+                minute,
+                0,
+            )
+            minute = 0
+        return hour, minute
+
+    def next_weekly_sales_report_run_at(
+        self,
+        *,
+        now_utc: datetime | None = None,
+    ) -> datetime:
+        current_utc = now_utc or datetime.now(timezone.utc)
+        if current_utc.tzinfo is None:
+            current_utc = current_utc.replace(tzinfo=timezone.utc)
+        else:
+            current_utc = current_utc.astimezone(timezone.utc)
+
+        report_timezone = self.weekly_report_timezone()
+        local_now = current_utc.astimezone(report_timezone)
+        report_hour, report_minute = self.weekly_report_time()
+        scheduled_local = local_now.replace(
+            hour=report_hour,
+            minute=report_minute,
+            second=0,
+            microsecond=0,
+        )
+        days_until_run = (self.weekly_report_weekday() - local_now.weekday()) % 7
+        if days_until_run == 0 and scheduled_local <= local_now:
+            days_until_run = 7
+        scheduled_local += timedelta(days=days_until_run)
+        return scheduled_local.astimezone(timezone.utc)
+
+    async def send_admin_notification_email(
+        self,
+        *,
+        subject: str,
+        body: str,
+        notification_type: str,
+    ) -> bool:
+        try:
+            email_timeout_seconds = max(
+                self.admin_email_notifier.settings.timeout_seconds + 5,
+                10,
+            )
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.admin_email_notifier.send_email,
+                    subject=subject,
+                    body=body,
+                    notification_type=notification_type,
+                ),
+                timeout=email_timeout_seconds,
+            )
+        except TimeoutError:
+            self.logger.error(
+                "admin_email_dispatch_timed_out notification_type=%s subject=%r timeout_seconds=%s timestamp=%s",
+                notification_type,
+                subject,
+                max(self.admin_email_notifier.settings.timeout_seconds + 5, 10),
+                utc_timestamp(),
+            )
+            return False
+        except Exception:
+            self.logger.exception(
+                "admin_email_dispatch_failed notification_type=%s subject=%r timestamp=%s",
+                notification_type,
+                subject,
+                utc_timestamp(),
+            )
+            return False
+
+    def build_support_ticket_alert_body(
+        self,
+        *,
+        member: discord.Member,
+        ticket_channel: discord.TextChannel,
+        opened_at_utc: str,
+    ) -> str:
+        display_name = member.display_name or member.name
+        username_line = (
+            f"Username: {display_name} ({member.name})"
+            if display_name != member.name
+            else f"Username: {member.name}"
+        )
+        return (
+            "A new support ticket has been opened.\n\n"
+            f"{username_line}\n"
+            f"User ID: {member.id}\n"
+            f"Ticket/Channel Name: {ticket_channel.name}\n"
+            f"Timestamp: {opened_at_utc}\n"
+            f"Guild: {ticket_channel.guild.name}\n"
+            f"Channel ID: {ticket_channel.id}"
+        )
+
+    def build_weekly_sales_report_body(self, summary: SalesSummary) -> str:
+        lines = [
+            "Weekly sales summary report",
+            "",
+            f"Period Start (UTC): {summary.period_start_utc.isoformat()}",
+            f"Period End (UTC): {summary.period_end_utc.isoformat()}",
+            "",
+            f"Total Sales Count: {summary.total_sales_count}",
+            f"Total Revenue: {self.format_currency(summary.total_revenue)}",
+            "",
+            "Payment Methods Used:",
+        ]
+        if summary.payment_method_breakdown:
+            lines.extend(
+                (
+                    f"- {payment_method.label}: "
+                    f"{payment_method.sales_count} sale(s), "
+                    f"{self.format_currency(payment_method.revenue)}"
+                )
+                for payment_method in summary.payment_method_breakdown
+            )
+        else:
+            lines.append("- No sales recorded during this reporting window.")
+        return "\n".join(lines)
+
+    async def send_support_ticket_alert(
+        self,
+        ticket_channel: discord.TextChannel,
+        member: discord.Member,
+        *,
+        opened_at_utc: str,
+    ) -> bool:
+        email_sent = await self.send_admin_notification_email(
+            subject=SUPPORT_TICKET_ALERT_SUBJECT,
+            body=self.build_support_ticket_alert_body(
+                member=member,
+                ticket_channel=ticket_channel,
+                opened_at_utc=opened_at_utc,
+            ),
+            notification_type="support_ticket_alert",
+        )
+        if not email_sent:
+            self.logger.warning(
+                "support_ticket_alert_email_failed channel_id=%s user_id=%s timestamp=%s",
+                ticket_channel.id,
+                member.id,
+                opened_at_utc,
+            )
+        return email_sent
+
+    async def send_weekly_sales_report(
+        self,
+        *,
+        report_end_utc: datetime | None = None,
+    ) -> bool:
+        normalized_end = report_end_utc or datetime.now(timezone.utc)
+        if normalized_end.tzinfo is None:
+            normalized_end = normalized_end.replace(tzinfo=timezone.utc)
+        else:
+            normalized_end = normalized_end.astimezone(timezone.utc)
+        normalized_start = normalized_end - timedelta(days=7)
+
+        try:
+            sales_summary = await asyncio.to_thread(
+                self.purchase_logger.summarize_sales,
+                period_start_utc=normalized_start,
+                period_end_utc=normalized_end,
+            )
+        except Exception:
+            self.logger.exception(
+                "weekly_sales_report_summary_failed period_start=%s period_end=%s timestamp=%s",
+                normalized_start.isoformat(),
+                normalized_end.isoformat(),
+                utc_timestamp(),
+            )
+            return False
+
+        email_sent = await self.send_admin_notification_email(
+            subject=WEEKLY_SALES_REPORT_SUBJECT,
+            body=self.build_weekly_sales_report_body(sales_summary),
+            notification_type="weekly_sales_report",
+        )
+        if not email_sent:
+            self.logger.warning(
+                "weekly_sales_report_email_failed period_start=%s period_end=%s timestamp=%s",
+                normalized_start.isoformat(),
+                normalized_end.isoformat(),
+                utc_timestamp(),
+            )
+        return email_sent
+
+    async def weekly_sales_report_loop(self) -> None:
+        try:
+            while not self.is_closed():
+                next_run_utc = self.next_weekly_sales_report_run_at()
+                sleep_seconds = max(
+                    (next_run_utc - datetime.now(timezone.utc)).total_seconds(),
+                    1.0,
+                )
+                self.logger.info(
+                    "weekly_sales_report_scheduled next_run_utc=%s sleep_seconds=%.2f",
+                    next_run_utc.isoformat(),
+                    sleep_seconds,
+                )
+                await asyncio.sleep(sleep_seconds)
+                if self.is_closed():
+                    return
+                await self.send_weekly_sales_report(report_end_utc=next_run_utc)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            self.logger.exception(
+                "weekly_sales_report_loop_failed timestamp=%s",
+                utc_timestamp(),
+            )
+
+    async def handle_email_test_command(self, message: discord.Message) -> bool:
+        if message.content.strip().lower() not in EMAIL_TEST_COMMAND_ALIASES:
+            return False
+
+        if message.guild is None:
+            await self.send_response(
+                message,
+                "`!EMAILTEST` can only be used inside a server.",
+            )
+            return True
+
+        if not self.message_author_is_administrator(message):
+            self.logger.warning(
+                "email_test_command_rejected user_id=%s channel_id=%s timestamp=%s",
+                message.author.id,
+                getattr(message.channel, "id", None),
+                utc_timestamp(),
+            )
+            await self.send_response(
+                message,
+                "You need Administrator permissions to use `!EMAILTEST`.",
+            )
+            return True
+
+        self.logger.info(
+            "email_test_command_requested user_id=%s channel_id=%s timestamp=%s",
+            message.author.id,
+            getattr(message.channel, "id", None),
+            utc_timestamp(),
+        )
+        email_sent = await self.send_admin_notification_email(
+            subject=EMAIL_TEST_SUBJECT,
+            body=EMAIL_TEST_BODY,
+            notification_type="email_test",
+        )
+        if email_sent:
+            await self.send_response(
+                message,
+                "Email system test sent to the admin recipient.",
+            )
+        else:
+            await self.send_response(
+                message,
+                "Email system test failed. Check the bot logs for details.",
+            )
+        return True
 
     def is_admin_bypass_user(self, user: discord.abc.User) -> bool:
         display_name = getattr(user, "display_name", user.name) or user.name
@@ -1339,9 +1677,10 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         self.logger.info(
-            "bot_ready user_id=%s username=%r timestamp=%s",
+            "bot_ready user_id=%s username=%r state_source=%s timestamp=%s",
             self.user.id,
             str(self.user),
+            self.state_load_source,
             utc_timestamp(),
         )
         print(f"Logged in as {self.user} ({self.user.id})")
@@ -1352,6 +1691,10 @@ class DiscordPurchaseBot(discord.Client):
         if self.purchase_sync_retry_task is None or self.purchase_sync_retry_task.done():
             self.purchase_sync_retry_task = asyncio.create_task(
                 self.purchase_sync_retry_loop()
+            )
+        if self.weekly_sales_report_task is None or self.weekly_sales_report_task.done():
+            self.weekly_sales_report_task = asyncio.create_task(
+                self.weekly_sales_report_loop()
             )
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
@@ -2196,12 +2539,13 @@ class DiscordPurchaseBot(discord.Client):
                 )
                 return
 
+        opened_at_utc = utc_timestamp()
         self.logger.info(
             "support_ticket_channel_created guild_id=%s channel_id=%s user_id=%s timestamp=%s",
             guild.id,
             ticket_channel.id,
             member.id,
-            utc_timestamp(),
+            opened_at_utc,
         )
         await self.audit_purchase_event(
             "support_ticket_opened",
@@ -2232,6 +2576,11 @@ class DiscordPurchaseBot(discord.Client):
         await interaction.response.send_message(
             f"Your support ticket is ready: {ticket_channel.mention}",
             ephemeral=True,
+        )
+        await self.send_support_ticket_alert(
+            ticket_channel,
+            member,
+            opened_at_utc=opened_at_utc,
         )
 
     async def handle_payment_button(self, interaction: discord.Interaction) -> None:
@@ -2822,13 +3171,22 @@ class DiscordPurchaseBot(discord.Client):
             else:
                 async with self.payment_parser_lock:
                     consumed_message_ids = await self.get_consumed_payment_message_ids_snapshot()
-                    parser_result = await asyncio.to_thread(
-                        check_payment_email,
-                        confirm_pressed_at_utc=confirm_pressed_at_utc,
-                        expected_amount=expected_amount,
-                        expected_payment_note=payment_note_code,
-                        consumed_message_ids=consumed_message_ids,
-                    )
+                    try:
+                        parser_result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                check_payment_email,
+                                confirm_pressed_at_utc=confirm_pressed_at_utc,
+                                expected_amount=expected_amount,
+                                expected_payment_note=payment_note_code,
+                                consumed_message_ids=consumed_message_ids,
+                            ),
+                            timeout=PAYMENT_PARSER_TIMEOUT_SECONDS,
+                        )
+                    except TimeoutError:
+                        parser_result = {
+                            "matched": False,
+                            "reason": "payment parser timed out",
+                        }
                     if parser_result.get("matched"):
                         gmail_message_id = cast(
                             str | None,
@@ -3288,11 +3646,42 @@ class DiscordPurchaseBot(discord.Client):
                 failure_reason="payment result message send failed",
             )
 
-    def persist_state(self) -> None:
+    def ensure_state_save_retry_task(self) -> None:
+        if (
+            self.state_save_retry_task is not None
+            and not self.state_save_retry_task.done()
+        ):
+            return
+        self.state_save_retry_task = asyncio.create_task(self.state_save_retry_loop())
+
+    async def state_save_retry_loop(self) -> None:
+        try:
+            while not self.is_closed():
+                await asyncio.sleep(STATE_SAVE_RETRY_INTERVAL_SECONDS)
+                async with self.state_lock:
+                    if not self.state_save_failed:
+                        return
+                    if self.persist_state():
+                        self.logger.info(
+                            "state_save_recovered source=%s timestamp=%s",
+                            self.state_load_source,
+                            utc_timestamp(),
+                        )
+                        return
+        except asyncio.CancelledError:
+            return
+
+    def persist_state(self) -> bool:
         try:
             save_state(self.state)
+            self.state_save_failed = False
+            return True
         except OSError:
-            self.logger.exception("state_save_failed timestamp=%s", utc_timestamp())
+            if not self.state_save_failed:
+                self.logger.exception("state_save_failed timestamp=%s", utc_timestamp())
+            self.state_save_failed = True
+            self.ensure_state_save_retry_task()
+            return False
 
     async def get_consumed_payment_message_ids_snapshot(self) -> set[str]:
         async with self.state_lock:
@@ -3311,10 +3700,8 @@ class DiscordPurchaseBot(discord.Client):
                 return False
 
             record_consumed_message_id(parser_state, gmail_message_id)
-            try:
-                save_state(self.state)
-            except OSError:
-                self.logger.exception(
+            if not self.persist_state():
+                self.logger.error(
                     "payment_parser_state_save_failed gmail_message_id=%s timestamp=%s",
                     gmail_message_id,
                     utc_timestamp(),
@@ -3342,6 +3729,12 @@ class DiscordPurchaseBot(discord.Client):
                 "Automatic verification did not find your payment in the recent inbox window yet.\n"
                 "Do this now: if you just paid, wait a moment and press `Check My Payment` again.\n"
                 "What happens next: if the payment has already gone through and it still is not detected, open a support ticket from the support panel for manual review."
+            )
+        if reason == "payment parser timed out":
+            return (
+                "Automatic verification is taking longer than expected right now.\n"
+                "Do this now: wait a moment and press `Check My Payment` again.\n"
+                "What happens next: if this keeps timing out after your payment already went through, open a support ticket from the support panel for manual review."
             )
         if reason == "payment note code unavailable":
             return (
@@ -3553,6 +3946,7 @@ class DiscordPurchaseBot(discord.Client):
         user_id: int,
         product: ScriptProduct,
         *,
+        payment_platform: PaymentPlatform | None = None,
         price_paid: str,
         purchase_timestamp: str,
     ) -> PurchaseRecord:
@@ -3572,6 +3966,8 @@ class DiscordPurchaseBot(discord.Client):
             "Item Key": product.key,
             "Delivered File": product.file_path.name,
             "Price Paid": price_paid,
+            "Payment Method": "" if payment_platform is None else payment_platform.label,
+            "Payment Method Key": "" if payment_platform is None else payment_platform.key,
             "Channel ID": channel.id,
             "Guild ID": guild_id,
             "Purchase Event ID": uuid4().hex,
@@ -3590,10 +3986,16 @@ class DiscordPurchaseBot(discord.Client):
             product,
             ticket_record=ticket_record,
         ) or (resolve_ticket_price_text(product) or "0.00")
+        payment_platform = None
+        if ticket_record is not None:
+            payment_platform = get_payment_platform_by_key(
+                cast(str | None, ticket_record.get("payment_platform_key"))
+            )
         purchase_record = await self.build_purchase_record(
             channel,
             user_id,
             product,
+            payment_platform=payment_platform,
             price_paid=price_paid,
             purchase_timestamp=purchase_timestamp,
         )
@@ -5492,6 +5894,22 @@ class DiscordPurchaseBot(discord.Client):
             return
 
         try:
+            if await self.handle_email_test_command(message):
+                return
+        except Exception:
+            self.logger.exception(
+                "email_test_command_exception channel_id=%s user_id=%s timestamp=%s",
+                getattr(message.channel, "id", None),
+                message.author.id,
+                utc_timestamp(),
+            )
+            await self.send_response(
+                message,
+                "The email test command failed unexpectedly. Check the bot logs for details.",
+            )
+            return
+
+        try:
             if await self.handle_admin_command(message):
                 return
         except Exception as exc:
@@ -5539,6 +5957,22 @@ class DiscordPurchaseBot(discord.Client):
                 return_exceptions=True,
             )
             self.purchase_sync_retry_task = None
+
+        if self.state_save_retry_task is not None:
+            self.state_save_retry_task.cancel()
+            await asyncio.gather(
+                self.state_save_retry_task,
+                return_exceptions=True,
+            )
+            self.state_save_retry_task = None
+
+        if self.weekly_sales_report_task is not None:
+            self.weekly_sales_report_task.cancel()
+            await asyncio.gather(
+                self.weekly_sales_report_task,
+                return_exceptions=True,
+            )
+            self.weekly_sales_report_task = None
 
         if self.payment_check_tasks:
             pending_tasks = tuple(self.payment_check_tasks)

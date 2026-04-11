@@ -20,6 +20,15 @@ def _parse_csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return values or default
 
 
+def _parse_csv_preserve_case_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    values = tuple(item.strip() for item in raw_value.split(",") if item.strip())
+    return values or default
+
+
 def _parse_bool_env(name: str, default: bool) -> bool:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -73,6 +82,10 @@ RUNTIME_DIR = _parse_path_env("DC_BOT_RUNTIME_DIR", "runtime")
 DATA_DIR = _parse_path_env("DC_BOT_DATA_DIR", RUNTIME_DIR / "data")
 LOG_DIR = _parse_path_env("DC_BOT_LOG_DIR", RUNTIME_DIR / "logs")
 STATE_FILE = _parse_path_env("DC_BOT_STATE_FILE", DATA_DIR / "dc_bot_state.json")
+STATE_BACKUP_FILE = _parse_path_env(
+    "DC_BOT_STATE_BACKUP_FILE",
+    DATA_DIR / "dc_bot_state.backup.json",
+)
 LOG_FILE = _parse_path_env("DC_BOT_LOG_FILE", LOG_DIR / "dc_bot.log")
 PAYMENT_PARSER_LOG_FILE = _parse_path_env(
     "DC_BOT_PAYMENT_PARSER_LOG_FILE",
@@ -102,6 +115,10 @@ GOOGLE_SHEETS_ERROR_TAB_NAME = (
 )
 GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 PURCHASE_SYNC_RETRY_INTERVAL_SECONDS = 300
+STATE_SAVE_RETRY_INTERVAL_SECONDS = _parse_int_env(
+    "DC_BOT_STATE_SAVE_RETRY_INTERVAL_SECONDS",
+    60,
+)
 
 GMAIL_API_CLIENT_ID_ENV = "GMAIL_API_CLIENT_ID"
 GMAIL_API_CLIENT_SECRET_ENV = "GMAIL_API_CLIENT_SECRET"
@@ -121,6 +138,10 @@ PAYMENT_PARSER_GMAIL_ADDRESS = (
 PAYMENT_PARSER_EXPECTED_AMOUNT = _parse_decimal_env(
     "PAYMENT_PARSER_EXPECTED_AMOUNT",
     Decimal("23.00"),
+)
+PAYMENT_PARSER_TIMEOUT_SECONDS = _parse_int_env(
+    "PAYMENT_PARSER_TIMEOUT_SECONDS",
+    60,
 )
 ALLOWED_FROM_DOMAINS = _parse_csv_env(
     "PAYMENT_PARSER_ALLOWED_FROM_DOMAINS",
@@ -168,6 +189,28 @@ REJECT_PASTED_STRONG_ONLY = _parse_bool_env(
 CONSUMED_MESSAGE_ID_RETENTION_DAYS = _parse_int_env(
     "PAYMENT_PARSER_CONSUMED_MESSAGE_ID_RETENTION_DAYS",
     30,
+)
+
+ADMIN_EMAIL_RECIPIENTS = _parse_csv_preserve_case_env(
+    "ADMIN_EMAIL_RECIPIENTS",
+    ("mr6jam3@gmail.com",),
+)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip() or "smtp.gmail.com"
+SMTP_PORT = _parse_int_env("SMTP_PORT", 587)
+SMTP_SENDER_ADDRESS = (
+    os.getenv("SMTP_SENDER_ADDRESS", "scriptz292@gmail.com").strip()
+    or "scriptz292@gmail.com"
+)
+SMTP_PASSWORD_ENV = "SMTP_PASSWORD"
+SMTP_TIMEOUT_SECONDS = _parse_int_env("SMTP_TIMEOUT_SECONDS", 30)
+WEEKLY_SALES_REPORT_WEEKDAY = (
+    os.getenv("WEEKLY_SALES_REPORT_WEEKDAY", "monday").strip().lower() or "monday"
+)
+WEEKLY_SALES_REPORT_HOUR = _parse_int_env("WEEKLY_SALES_REPORT_HOUR", 9)
+WEEKLY_SALES_REPORT_MINUTE = _parse_int_env("WEEKLY_SALES_REPORT_MINUTE", 0)
+WEEKLY_SALES_REPORT_TIMEZONE = (
+    os.getenv("WEEKLY_SALES_REPORT_TIMEZONE", "America/New_York").strip()
+    or "America/New_York"
 )
 
 DISCORD_MESSAGE_LIMIT = 2000

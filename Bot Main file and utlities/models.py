@@ -62,10 +62,13 @@ PurchaseRecord = TypedDict(
         "Item Key": str,
         "Delivered File": str,
         "Price Paid": str,
+        "Payment Method": str,
+        "Payment Method Key": str,
         "Channel ID": int,
         "Guild ID": int,
         "Purchase Event ID": str,
     },
+    total=False,
 )
 
 PURCHASE_LOG_COLUMNS: tuple[str, ...] = (

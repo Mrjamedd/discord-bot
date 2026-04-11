@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from config import (
     CONSUMED_MESSAGE_ID_RETENTION_DAYS,
+    STATE_BACKUP_FILE,
     STATE_FILE,
 )
 from models import BotState, ParserReplayState, TicketRecord
@@ -17,6 +21,13 @@ from ticketing import (
     resolve_script_product_key,
 )
 from utils import ensure_parent_directory
+
+
+@dataclass(frozen=True)
+class StateLoadResult:
+    state: BotState
+    source: str
+    warnings: tuple[str, ...] = ()
 
 
 def fresh_payment_parser_state() -> ParserReplayState:
@@ -145,29 +156,106 @@ def _coerce_state(value: object) -> BotState:
     return state
 
 
-def load_state() -> BotState:
-    if not STATE_FILE.exists():
-        return {
-            "tickets": {},
-            "payment_parser": fresh_payment_parser_state(),
-        }
+def _default_state() -> BotState:
+    return {
+        "tickets": {},
+        "payment_parser": fresh_payment_parser_state(),
+    }
 
+
+def _archive_invalid_state_file(state_file: Path) -> str | None:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_name = (
+        f"{state_file.stem}.corrupt-{timestamp}{state_file.suffix or '.json'}"
+    )
+    archive_path = state_file.with_name(archive_name)
     try:
-        raw_state: object = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {
-            "tickets": {},
-            "payment_parser": fresh_payment_parser_state(),
-        }
+        state_file.replace(archive_path)
+    except OSError as exc:
+        return (
+            f"Failed to archive unreadable state file {state_file} to {archive_path}: {exc}"
+        )
+    return f"Archived unreadable state file to {archive_path}"
+
+
+def _load_state_file(state_file: Path) -> BotState:
+    raw_state: object = json.loads(state_file.read_text(encoding="utf-8"))
     return _coerce_state(raw_state)
 
 
+def load_state_result() -> StateLoadResult:
+    warnings: list[str] = []
+
+    for source_name, state_file in (
+        ("primary", STATE_FILE),
+        ("backup", STATE_BACKUP_FILE),
+    ):
+        if not state_file.exists():
+            continue
+
+        try:
+            state = _load_state_file(state_file)
+        except json.JSONDecodeError as exc:
+            warnings.append(f"State file {state_file} is invalid JSON: {exc}")
+            if source_name == "primary":
+                archive_warning = _archive_invalid_state_file(state_file)
+                if archive_warning is not None:
+                    warnings.append(archive_warning)
+            continue
+        except OSError as exc:
+            warnings.append(f"State file {state_file} could not be read: {exc}")
+            continue
+
+        if source_name == "backup":
+            warnings.append(f"Recovered bot state from backup file {state_file}.")
+        return StateLoadResult(
+            state=state,
+            source=source_name,
+            warnings=tuple(warnings),
+        )
+
+    return StateLoadResult(
+        state=_default_state(),
+        source="fresh",
+        warnings=tuple(warnings),
+    )
+
+
+def load_state() -> BotState:
+    return load_state_result().state
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        directory_fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_atomic_text(file_path: Path, content: str) -> None:
+    ensure_parent_directory(file_path)
+    temp_file = file_path.with_name(f"{file_path.name}.tmp")
+    with temp_file.open("w", encoding="utf-8") as output_file:
+        output_file.write(content)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    temp_file.replace(file_path)
+    _fsync_directory(file_path.parent)
+
+
 def save_state(state: BotState) -> None:
-    serialized = json.dumps(state, indent=2)
-    ensure_parent_directory(STATE_FILE)
-    temp_file = STATE_FILE.with_suffix(".tmp")
-    temp_file.write_text(serialized, encoding="utf-8")
-    temp_file.replace(STATE_FILE)
+    serialized = json.dumps(state, indent=2, sort_keys=True)
+    _write_atomic_text(STATE_FILE, serialized)
+    try:
+        _write_atomic_text(STATE_BACKUP_FILE, serialized)
+    except OSError:
+        # The primary state write already succeeded. Keep the backup as
+        # best-effort so transient backup failures do not block the bot.
+        return
 
 
 def get_ticket_record(
