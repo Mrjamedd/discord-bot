@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Deployment
+
+- Bundled the Gmail receipt parser into the repository so a fresh clone no longer depends on a sibling `discord_bot_private` checkout.
+- Declared the clean-deployment parser dependencies explicitly with `requests` and `tzdata`.
+- Replaced real admin-email defaults with blank optional settings in `.env.example` and runtime config.
+- Updated the deployment docs to reflect the bundled parser flow and the actual dirty-checkout behavior of the OCI startup wrapper.
+
 ## v0.9.0 - 2026-03-27
 
 First tagged pre-1.0 release for the current codebase.

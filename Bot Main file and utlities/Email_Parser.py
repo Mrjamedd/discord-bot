@@ -9,9 +9,13 @@ from typing import Any
 
 
 PRIVATE_EMAIL_PARSER_ENV = "DC_BOT_PRIVATE_EMAIL_PARSER_PATH"
-DEFAULT_PRIVATE_EMAIL_PARSER_PATH = (
+_BUNDLED_PRIVATE_EMAIL_PARSER_PATH = Path(__file__).resolve().with_name(
+    "bundled_email_parser.py"
+)
+_LEGACY_PRIVATE_EMAIL_PARSER_PATH = (
     Path(__file__).resolve().parents[2] / "discord_bot_private" / "Email_Parser_private.py"
 )
+DEFAULT_PRIVATE_EMAIL_PARSER_PATH = _BUNDLED_PRIVATE_EMAIL_PARSER_PATH
 
 
 def _candidate_private_parser_paths() -> tuple[Path, ...]:
@@ -19,7 +23,8 @@ def _candidate_private_parser_paths() -> tuple[Path, ...]:
     candidates: list[Path] = []
     if configured_path:
         candidates.append(Path(configured_path).expanduser())
-    candidates.append(DEFAULT_PRIVATE_EMAIL_PARSER_PATH)
+    candidates.append(_BUNDLED_PRIVATE_EMAIL_PARSER_PATH)
+    candidates.append(_LEGACY_PRIVATE_EMAIL_PARSER_PATH)
 
     unique_candidates: list[Path] = []
     seen: set[Path] = set()
@@ -50,15 +55,15 @@ def _load_private_email_parser() -> ModuleType:
             spec.loader.exec_module(module)
         except Exception as exc:
             raise ImportError(
-                "Private email parser implementation failed to load. "
+                "Payment parser implementation failed to load. "
                 f"Path: {candidate_path}. Error: {exc}"
             ) from exc
         return module
 
     searched = ", ".join(searched_paths) if searched_paths else "<none>"
     raise ImportError(
-        "Private email parser implementation not found. "
-        f"Set {PRIVATE_EMAIL_PARSER_ENV} or install Email_Parser_private.py. "
+        "Payment parser implementation not found. "
+        f"Set {PRIVATE_EMAIL_PARSER_ENV} or restore bundled_email_parser.py. "
         f"Searched: {searched}"
     )
 
@@ -173,6 +178,8 @@ class _PrivateEmailParserProxyModule(ModuleType):
     _LOCAL_ONLY_NAMES = frozenset(
         {
             "PRIVATE_EMAIL_PARSER_ENV",
+            "_BUNDLED_PRIVATE_EMAIL_PARSER_PATH",
+            "_LEGACY_PRIVATE_EMAIL_PARSER_PATH",
             "DEFAULT_PRIVATE_EMAIL_PARSER_PATH",
             "_candidate_private_parser_paths",
             "_load_private_email_parser",

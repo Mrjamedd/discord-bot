@@ -193,13 +193,12 @@ CONSUMED_MESSAGE_ID_RETENTION_DAYS = _parse_int_env(
 
 ADMIN_EMAIL_RECIPIENTS = _parse_csv_preserve_case_env(
     "ADMIN_EMAIL_RECIPIENTS",
-    ("mr6jam3@gmail.com",),
+    (),
 )
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip() or "smtp.gmail.com"
 SMTP_PORT = _parse_int_env("SMTP_PORT", 587)
 SMTP_SENDER_ADDRESS = (
-    os.getenv("SMTP_SENDER_ADDRESS", "scriptz292@gmail.com").strip()
-    or "scriptz292@gmail.com"
+    os.getenv("SMTP_SENDER_ADDRESS", "").strip()
 )
 SMTP_PASSWORD_ENV = "SMTP_PASSWORD"
 SMTP_TIMEOUT_SECONDS = _parse_int_env("SMTP_TIMEOUT_SECONDS", 30)

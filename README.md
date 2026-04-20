@@ -9,6 +9,7 @@ The bot no longer reads asset directories from environment variables and no long
 ## What Is Included
 
 - Bot source code
+- A bundled Gmail receipt parser implementation
 - A root launcher (`run_bot.py`) that loads `.env` settings before startup
 - `requirements.txt`
 - Docker support
@@ -65,10 +66,13 @@ python3 run_bot.py
 
 The launcher reads a repo-local `.env` automatically and falls back to `$HOME/.env` when the repo file is absent. Runtime startup also validates the canonical asset directory before the bot connects to Discord. This quick-start flow is safe to use for basic local verification before moving on to OCI deployment.
 
+No sibling `discord_bot_private` checkout is required. The default Gmail parser now ships in this repository. Set `DC_BOT_PRIVATE_EMAIL_PARSER_PATH` only if you intentionally want to override it with a custom module file.
+
 ## Cloud Deployment Notes
 
 - Runtime state, purchase logs, and recovery files default to `runtime/` and are ignored by Git.
 - The launcher first checks for a repo-local `.env`. If that file is missing, it falls back to `$HOME/.env` when that file contains bot settings, which matches deployments that keep secrets in `/home/ubuntu/.env`.
+- The default Gmail receipt parser is bundled with the repo. Set `DC_BOT_PRIVATE_EMAIL_PARSER_PATH` only if you want to replace it with a custom parser module.
 - Override `DC_BOT_RUNTIME_DIR` if your server uses a different writable path.
 - You can also override the individual runtime paths with `DC_BOT_DATA_DIR`, `DC_BOT_STATE_FILE`, `DC_BOT_PURCHASE_LOG_FILE`, and `DC_BOT_PURCHASE_SYNC_RECOVERY_FILE`.
 - The legacy `DC_BOT_LOG_DIR`, `DC_BOT_LOG_FILE`, and `DC_BOT_PAYMENT_PARSER_LOG_FILE` settings remain deprecated because runtime error reporting no longer writes rotating local log files.
@@ -130,7 +134,7 @@ How startup works with the default unit:
 - it installs dependencies only when `requirements.txt` changed, using `PIP_BIN` when set or `PYTHON_BIN -m pip` otherwise
 - it launches `python run_bot.py`
 
-If the live checkout is dirty, startup fails instead of overwriting local changes. That keeps the server copy aligned with GitHub instead of silently diverging.
+If the live checkout is dirty, startup skips the auto-update step and starts the current local revision instead of overwriting local changes. That keeps the server copy aligned with GitHub without silently discarding server-side edits.
 
 If the repo lives somewhere other than `/opt/discord-purchase-bot`, render the unit with overrides:
 
@@ -159,4 +163,4 @@ docker run --env-file .env \
   discord-purchase-bot
 ```
 
-If you use Google Sheets with a mounted credentials file, mount that path too. If your platform supports secret injection, prefer `GOOGLE_SHEETS_CREDENTIALS_JSON`.
+If you use Google Sheets with a mounted credentials file, mount that path too. If your platform supports secret injection, prefer `GOOGLE_SHEETS_CREDENTIALS_JSON`. No extra payment-parser mount is required unless you explicitly override `DC_BOT_PRIVATE_EMAIL_PARSER_PATH`.

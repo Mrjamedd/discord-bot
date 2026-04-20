@@ -3,11 +3,10 @@ from __future__ import annotations
 import os
 
 from Email_Parser import private_email_parser_config_error
-from admin_email import AdminEmailNotifier
+from admin_email import AdminEmailNotifier, load_admin_email_settings
 from assets import validate_script_asset_directory
 from bot import DiscordPurchaseBot
 from config import (
-    ADMIN_EMAIL_RECIPIENTS,
     CASH_APP_CASHTAG,
     GMAIL_API_CLIENT_ID_ENV,
     GMAIL_API_CLIENT_SECRET_ENV,
@@ -84,13 +83,18 @@ def _runtime_configuration_warnings() -> list[str]:
             "Google Sheets credentials are present but GOOGLE_SHEETS_SPREADSHEET_ID is not set. "
             "Completed purchases will still be logged locally, but purchase audit logging and structured error reports will not be written to Google Sheets."
         )
+    admin_email_settings = load_admin_email_settings()
+    if not admin_email_settings.recipients:
+        warnings.append(
+            "Admin email notifications are disabled because no admin recipients are configured."
+        )
+    if not admin_email_settings.sender_address:
+        warnings.append(
+            "Admin email notifications are disabled because SMTP_SENDER_ADDRESS is not set."
+        )
     if not (os.getenv(SMTP_PASSWORD_ENV) or "").strip():
         warnings.append(
             "Admin email notifications are disabled because SMTP_PASSWORD is not set."
-        )
-    if not ADMIN_EMAIL_RECIPIENTS:
-        warnings.append(
-            "Admin email notifications are disabled because no admin recipients are configured."
         )
     return warnings
 
